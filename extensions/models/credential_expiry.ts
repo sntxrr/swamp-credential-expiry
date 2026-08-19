@@ -126,6 +126,17 @@ const AuditSchema = z.object({
    * a standing design debt to be tracked, not a nightly page.
    */
   actionable: z.boolean(),
+  /**
+   * True when today is a day worth interrupting someone. `actionable` alone is
+   * the wrong gate for a daily run: a credential 29 days out is actionable for
+   * 29 consecutive days, and an alert that repeats an unchanged fact daily for a
+   * month is one that gets filtered. This fires on the day a threshold is
+   * CROSSED, then every day once inside `criticalDays`, and immediately for any
+   * outage-shaped status.
+   */
+  notifyToday: z.boolean(),
+  /** Why `notifyToday` is set, for the notification subject line. */
+  notifyReason: z.string(),
   /** One line per non-ok credential, ready to drop into a notification body. */
   summary: z.string(),
 });
@@ -210,6 +221,37 @@ export function preflight(
     byName.set(name, c.id);
   }
   return problems;
+}
+
+/**
+ * Should today's run interrupt anyone?
+ *
+ * Anything outage-shaped always does. Otherwise it fires on the exact day a
+ * warn threshold is crossed, and every day once inside `criticalDays` -- so a
+ * 90-day credential produces four notifications in its life rather than thirty.
+ */
+export function shouldNotify(
+  results: Array<{ status: Status; daysRemaining: number | null }>,
+  policy: { warnDays: number[]; criticalDays: number },
+): { notify: boolean; reason: string } {
+  const urgent = results.filter((r) =>
+    r.status === "authFailed" || r.status === "expired" ||
+    r.status === "unreachable"
+  );
+  if (urgent.length > 0) {
+    return { notify: true, reason: urgent[0].status };
+  }
+  const critical = results.filter((r) =>
+    r.daysRemaining !== null && r.daysRemaining <= policy.criticalDays
+  );
+  if (critical.length > 0) return { notify: true, reason: "critical" };
+
+  const crossing = results.some((r) =>
+    r.daysRemaining !== null && policy.warnDays.includes(r.daysRemaining)
+  );
+  return crossing
+    ? { notify: true, reason: "threshold" }
+    : { notify: false, reason: "" };
 }
 
 /** Map days-remaining onto a status, given the configured thresholds. */
@@ -346,7 +388,7 @@ export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.08.19.1",
+  version: "2026.08.19.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     "credential": {
@@ -407,6 +449,9 @@ export const model = {
           ok: 0,
         };
         const lines: string[] = [];
+        const outcomes: Array<
+          { status: Status; daysRemaining: number | null }
+        > = [];
         let soonestDays: number | null = null;
         let soonestId: string | null = null;
 
@@ -416,6 +461,10 @@ export const model = {
             : await probeGithubPat(cred.secret, globalArgs, now);
 
           counts[result.status] += 1;
+          outcomes.push({
+            status: result.status,
+            daysRemaining: result.daysRemaining,
+          });
 
           if (
             result.daysRemaining !== null &&
@@ -476,6 +525,8 @@ export const model = {
           },
         );
 
+        const { notify, reason } = shouldNotify(outcomes, globalArgs);
+
         handles.push(
           await context.writeResource("audit", "current", {
             checkedAt,
@@ -484,6 +535,8 @@ export const model = {
             soonestDays,
             soonestId,
             actionable,
+            notifyToday: notify,
+            notifyReason: reason,
             summary: lines.join("\n"),
           }),
         );

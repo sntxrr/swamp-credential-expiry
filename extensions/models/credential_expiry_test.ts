@@ -106,3 +106,45 @@ Deno.test("preflight rejects an id with no usable characters", () => {
   assertEquals(problems.length, 1);
   assertEquals(problems[0].includes("no usable characters"), true);
 });
+
+import { shouldNotify } from "./credential_expiry.ts";
+
+const P = { warnDays: [30, 14, 7], criticalDays: 3 };
+
+Deno.test("shouldNotify fires on the day a threshold is crossed, not before or after", () => {
+  // The whole point: a 29-day credential is actionable for 29 days running, and
+  // an alert that repeats an unchanged fact daily for a month gets filtered.
+  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 30 }], P).notify, true);
+  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 29 }], P).notify, false);
+  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 15 }], P).notify, false);
+  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 14 }], P).notify, true);
+  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 7 }], P).notify, true);
+});
+
+Deno.test("shouldNotify fires every day once inside criticalDays", () => {
+  for (const d of [3, 2, 1, 0]) {
+    assertEquals(shouldNotify([{ status: "critical", daysRemaining: d }], P).notify, true);
+  }
+});
+
+Deno.test("shouldNotify always fires for outage-shaped statuses", () => {
+  for (const s of ["authFailed", "expired", "unreachable"] as const) {
+    const got = shouldNotify([{ status: s, daysRemaining: null }], P);
+    assertEquals(got.notify, true);
+    assertEquals(got.reason, s);
+  }
+});
+
+Deno.test("shouldNotify stays quiet for ok and for noExpiry", () => {
+  assertEquals(shouldNotify([{ status: "ok", daysRemaining: 89 }], P).notify, false);
+  // noExpiry is standing design debt for a review, never a nightly page.
+  assertEquals(shouldNotify([{ status: "noExpiry", daysRemaining: null }], P).notify, false);
+});
+
+Deno.test("shouldNotify reports the worst reason when several apply", () => {
+  const got = shouldNotify([
+    { status: "warn", daysRemaining: 30 },
+    { status: "authFailed", daysRemaining: null },
+  ], P);
+  assertEquals(got.reason, "authFailed");
+});

@@ -46,6 +46,23 @@ Three of these distinctions exist because collapsing them produces a worse alert
   A credential that lapsed at some point may already have been replaced everywhere.
 - **`unreachable` is not either.** Otherwise a DNS blip reads as a dead credential.
 
+## Alerting: gate on `notifyToday`, not on `actionable`
+
+`actionable` says something needs a human *eventually*. It is the wrong gate for a daily
+run: a credential 29 days out is actionable for 29 consecutive days, and an alert that
+repeats an unchanged fact every day for a month is one that gets filtered — at which point
+the monitor has made things worse than no monitor.
+
+`notifyToday` is the gate. It fires:
+
+- **immediately** for anything outage-shaped (`authFailed`, `expired`, `unreachable`);
+- on the **exact day** a `warnDays` threshold is crossed;
+- **every day** once inside `criticalDays`;
+- **never** for `noExpiry` or `ok`.
+
+A 90-day credential therefore produces four notifications in its life rather than thirty.
+`notifyReason` carries which of those applied, for the subject line.
+
 ## Usage
 
 ```yaml

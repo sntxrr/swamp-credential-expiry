@@ -33,6 +33,23 @@ keeping separate, because collapsing any of them produces a worse alert:
 `daysRemaining` is floored, never rounded. 0.9 days left reads as `0`, because rounding up
 would let a credential expire on a day the report called safe.
 
+## Alerting: gate on `notifyToday`, not on `actionable`
+
+`actionable` says something needs a human *eventually*. It is the wrong gate for a daily
+run: a credential 29 days out is actionable for 29 consecutive days, and an alert that
+repeats an unchanged fact every day for a month is one that gets filtered — at which point
+the monitor has made things worse than no monitor.
+
+`notifyToday` is the gate. It fires:
+
+- **immediately** for anything outage-shaped (`authFailed`, `expired`, `unreachable`);
+- on the **exact day** a `warnDays` threshold is crossed;
+- **every day** once inside `criticalDays`;
+- **never** for `noExpiry` or `ok`.
+
+A 90-day credential therefore produces four notifications in its life rather than thirty.
+`notifyReason` carries which of those applied, for the subject line.
+
 ## Usage
 
 See [`extensions/models/README.md`](extensions/models/README.md) for the full reference.
