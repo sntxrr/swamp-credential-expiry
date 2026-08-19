@@ -165,6 +165,53 @@ export function parseGithubExpiryHeader(value: string | null): number | null {
   return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
 }
 
+/**
+ * Resource instance names are derived from the credential id, but ids are
+ * manifest-shaped (`connect-token/deploy-bot`) and a `/` in a storage key is a
+ * hazard in every system that has ever had one. The sibling sweep model in this
+ * fleet quietly avoids the same thing by writing bare repo names rather than
+ * `owner/repo`; this makes the reason explicit instead.
+ *
+ * The raw id is still written into the resource body, so nothing is lost -- only
+ * the key is normalised.
+ */
+export function resourceNameFor(id: string): string {
+  return id.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/**
+ * Fail before probing anything, not halfway through.
+ *
+ * Two ids that differ but normalise to the same instance name would have the
+ * second silently overwrite the first -- one credential would vanish from the
+ * audit while the run still reported success, which is precisely the silent
+ * under-count this model exists to prevent elsewhere.
+ */
+export function preflight(
+  credentials: Array<{ id: string }>,
+): string[] {
+  const problems: string[] = [];
+  const seenId = new Set<string>();
+  const byName = new Map<string, string>();
+  for (const c of credentials) {
+    if (seenId.has(c.id)) problems.push(`duplicate id: ${c.id}`);
+    seenId.add(c.id);
+    const name = resourceNameFor(c.id);
+    if (!name) {
+      problems.push(`id has no usable characters for a resource name: ${c.id}`);
+      continue;
+    }
+    const clash = byName.get(name);
+    if (clash && clash !== c.id) {
+      problems.push(
+        `ids "${clash}" and "${c.id}" both normalise to resource name "${name}"`,
+      );
+    }
+    byName.set(name, c.id);
+  }
+  return problems;
+}
+
 /** Map days-remaining onto a status, given the configured thresholds. */
 export function classify(
   daysRemaining: number | null,
@@ -335,6 +382,18 @@ export const model = {
         },
       ) => {
         const { globalArgs, logger } = context;
+
+        const problems = preflight(globalArgs.credentials);
+        if (problems.length > 0) {
+          // Refuse the whole run. A partial audit that still reports success is
+          // worse than no audit -- it is the shape of every silent under-count.
+          throw new Error(
+            `credential-expiry configuration is invalid:\n  ${
+              problems.join("\n  ")
+            }`,
+          );
+        }
+
         const now = new Date();
         const checkedAt = now.toISOString();
         const handles: Array<{ name: string }> = [];
@@ -385,16 +444,20 @@ export const model = {
           });
 
           handles.push(
-            await context.writeResource("credential", cred.id, {
-              id: cred.id,
-              kind: cred.kind,
-              status: result.status,
-              expiresAt: result.expiresAt,
-              daysRemaining: result.daysRemaining,
-              note: cred.note,
-              detail: result.detail,
-              checkedAt,
-            }),
+            await context.writeResource(
+              "credential",
+              resourceNameFor(cred.id),
+              {
+                id: cred.id,
+                kind: cred.kind,
+                status: result.status,
+                expiresAt: result.expiresAt,
+                daysRemaining: result.daysRemaining,
+                note: cred.note,
+                detail: result.detail,
+                checkedAt,
+              },
+            ),
           );
         }
 

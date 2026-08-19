@@ -68,3 +68,41 @@ Deno.test("classify reports no-expiry as its own state, never as ok", () => {
   // model exists because of.
   assertEquals(classify(null, policy), "noExpiry");
 });
+
+import { preflight, resourceNameFor } from "./credential_expiry.ts";
+
+Deno.test("resourceNameFor strips characters unsafe in a storage key", () => {
+  // Manifest ids are path-shaped; instance names must not be.
+  assertEquals(resourceNameFor("connect-token/deploy-bot"), "connect-token-deploy-bot");
+  assertEquals(resourceNameFor("pat/sweep"), "pat-sweep");
+  assertEquals(resourceNameFor("already.safe_id-1"), "already.safe_id-1");
+  assertEquals(resourceNameFor("/leading/and/trailing/"), "leading-and-trailing");
+});
+
+Deno.test("preflight passes a clean config", () => {
+  assertEquals(
+    preflight([{ id: "connect-token/a" }, { id: "pat/b" }]),
+    [],
+  );
+});
+
+Deno.test("preflight catches duplicate ids", () => {
+  const problems = preflight([{ id: "same" }, { id: "same" }]);
+  assertEquals(problems.length, 1);
+  assertEquals(problems[0].includes("duplicate id"), true);
+});
+
+Deno.test("preflight catches ids that collide after normalisation", () => {
+  // These differ, but both become "a-b" -- the second would silently overwrite
+  // the first's resource and one credential would vanish from the audit while
+  // the run still reported success.
+  const problems = preflight([{ id: "a/b" }, { id: "a:b" }]);
+  assertEquals(problems.length, 1);
+  assertEquals(problems[0].includes("normalise to resource name"), true);
+});
+
+Deno.test("preflight rejects an id with no usable characters", () => {
+  const problems = preflight([{ id: "///" }]);
+  assertEquals(problems.length, 1);
+  assertEquals(problems[0].includes("no usable characters"), true);
+});

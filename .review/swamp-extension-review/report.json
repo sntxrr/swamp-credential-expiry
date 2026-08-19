@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/credential-expiry",
+  "version": "2026.08.19.1",
+  "reviewedAt": "2026-08-19T17:32:50Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "`secret` is z.string().meta({sensitive:true}). It is never logged (the only log line carries id and status), never written to a resource, and never interpolated into `detail`. The one place external text reaches `detail` is String(cause) from a failed fetch; the token travels in an Authorization header, not the URL, so it is not in the error. Probes are decode-or-GET only."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Structured fields, no interpolation of values into message strings. One line per credential plus a run summary, so a scheduled run is readable rather than noisy."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Three failure modes kept distinct on purpose: authFailed (401/403 or unparseable value) is an outage in progress, unreachable is a statement about the network, expired is neither. Collapsing them yields an alert that cries wolf over a DNS blip. AbortSignal.timeout bounds every request."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "13 tests over every pure function, including the cases that actually bit: a truncated JWT must be malformed rather than no-expiry, exp must be numeric, days must floor not round, and noExpiry must never classify as ok. NOT covered: the fetch path in probeGithubPat and the audit method itself, both of which need HTTP and writeResource fakes. Those were exercised manually against live credentials before publish, not in CI."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Read-only and repeatable: no method mutates anything anywhere. Re-running overwrites the same resource instances with a fresh reading, which is the intended behaviour for a monitor."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Two contracts. GitHub's github-authentication-token-expiration response header is documented behaviour and its absence is handled as noExpiry rather than as an error. JWT decoding is deliberately unverified -- signature verification is the issuing server's job, and this model has no key material to do it with."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Two specs, both lifetime infinite with garbageCollection 30, matching the sibling models in this fleet."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Screened against the 30-pattern secret denylist and separately for internal hostnames, vault names and credential ids: clean. Examples in both READMEs are fictional. Local model instances are gitignored. The pre-push hook is installed and was verified with both controls -- a deliberate denylist term is refused, a clean commit passes."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Zod throughout: probe kind and status are enums off const tuples so the runtime list and the type cannot drift, credentials is min(1), every field carries a describe. Thresholds are positive ints."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "See resource-management. 30 generations retains enough history to see a credential approach expiry across runs without unbounded growth."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Deliberately absent. This model observes; it has no create, rotate or revoke. That is what makes it safe to schedule unattended against production credentials, and it is stated in the module docs and both READMEs so the omission reads as a decision rather than an oversight."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "preflight() runs before any probe and refuses the whole run on duplicate ids, ids that collide after normalisation, or an id with no usable characters. Added during this review: without it, two ids normalising to one instance name would have the second silently overwrite the first, dropping a credential from the audit while the run still reported success -- the exact silent under-count this model exists to prevent."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Resource names go through resourceNameFor(), which maps anything outside [A-Za-z0-9._-] to '-'. Manifest ids are path-shaped (connect-token/deploy-bot) and a '/' in a storage key is a hazard everywhere it has ever appeared; the sibling sweep model avoids the same thing implicitly by writing bare repo names, and this makes the reason explicit. The raw id is still written into the resource body. The audit summary is instance 'current', matching the sibling, because data.latest() takes the instance name."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Writes only through context.writeResource; reads nothing from the datastore. No direct filesystem or database access."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "First publish, so no drift to reconcile. model.version and manifest version are both 2026.08.19.1 and must be bumped together."
+    }
+  ]
+}
