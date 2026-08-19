@@ -25,17 +25,25 @@
  *    credential this model exists because of. It gets its own status and is
  *    counted separately.
  *
- * 3. **An authentication failure is an outage in progress, not a warning.** If
- *    a probe gets 401/403, the credential is already dead — days-remaining is
+ * 3. **An authentication failure is an outage in progress, not a warning.** A
+ *    credential being refused *now* is already dead — days-remaining is
  *    meaningless and thresholds do not apply. `authFailed` is reported
  *    separately from `expired` so an alert can page on it immediately, and
  *    separately again from `unreachable`, which is a statement about the
  *    network rather than about the credential.
  *
+ *    What counts as refusal is provider-specific, and getting it wrong in
+ *    either direction is expensive. GitLab answers a dead token with `401` but
+ *    answers a *working* token that merely lacks the scope to introspect
+ *    itself with `403 insufficient_scope`; reading that as `authFailed` would
+ *    page somebody over a credential that is doing its job. Each probe decides
+ *    for its own provider rather than sharing one rule.
+ *
  * 4. **Read-only, by construction.** Every probe here is a decode or a GET.
  *    There is no method that can create, rotate or revoke anything, which is
  *    what makes it safe to run unattended on a schedule against production
- *    credentials.
+ *    credentials. Rotation deliberately lives elsewhere — see
+ *    `@sntxrr/gitlab-token` for the GitLab lifecycle side.
  *
  * @module
  */
@@ -43,7 +51,7 @@
 import { z } from "npm:zod@4";
 
 /** How a credential's expiry can be discovered. */
-export const PROBE_KINDS = ["jwt", "github-pat"] as const;
+export const PROBE_KINDS = ["jwt", "github-pat", "gitlab-pat"] as const;
 export type ProbeKind = typeof PROBE_KINDS[number];
 
 /**
@@ -67,7 +75,9 @@ const CredentialInputSchema = z.object({
     "Stable identifier, matching the manifest entry this credential corresponds to, e.g. connect-token/deploy-bot",
   ),
   kind: z.enum(PROBE_KINDS).describe(
-    "How to read this credential's expiry. `jwt` decodes the exp claim; `github-pat` reads GitHub's token-expiration response header.",
+    "How to read this credential's expiry. `jwt` decodes the exp claim; " +
+      "`github-pat` reads GitHub's token-expiration response header; " +
+      "`gitlab-pat` reads expires_at from GitLab's token self-introspection endpoint.",
   ),
   secret: z.string().min(1).meta({ sensitive: true }).describe(
     "The credential itself. Supply via vault.get() — never inline. This is the same value the consuming job uses, deliberately: see module docs.",
@@ -89,6 +99,9 @@ const GlobalArgsSchema = z.object({
   ),
   apiBaseUrl: z.string().url().default("https://api.github.com").describe(
     "GitHub API base URL, for `github-pat` probes. Override for GitHub Enterprise Server.",
+  ),
+  gitlabBaseUrl: z.string().url().default("https://gitlab.com").describe(
+    "GitLab instance base URL, for `gitlab-pat` probes, without the /api/v4 suffix. Override for self-managed.",
   ),
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Abort any single probe request after this long.",
@@ -173,6 +186,22 @@ export function parseGithubExpiryHeader(value: string | null): number | null {
   // Format: "2026-11-11 23:58:42 UTC"
   const cleaned = value.trim().replace(/\s+UTC$/i, "Z").replace(" ", "T");
   const ms = Date.parse(cleaned);
+  return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
+}
+
+/**
+ * GitLab reports expiry as a bare `YYYY-MM-DD` date, not a timestamp, so the
+ * moment of death has to be chosen rather than read.
+ *
+ * It is anchored to UTC midnight at the *start* of that date — the earliest
+ * instant the token could stop working. Choosing the end of the day instead
+ * would buy a day of apparent headroom that may not exist, and an expiry
+ * monitor that is optimistic by a day is one that reports safe on the morning
+ * something has already broken.
+ */
+export function parseGitlabExpiryDate(value: unknown): number | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const ms = Date.parse(`${value.trim()}T00:00:00Z`);
   return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
 }
 
@@ -384,11 +413,151 @@ async function probeGithubPat(
   return fromEpoch(exp, now, globalArgs);
 }
 
+/**
+ * GitLab has no expiry header; a token's own record is read back through
+ * `/personal_access_tokens/self`, which works for project and group access
+ * tokens too — GitLab implements both as personal tokens belonging to a bot
+ * user.
+ *
+ * The reason this probe is longer than the GitHub one is the 403. GitLab
+ * answers an invalid, revoked or expired token with `401`, but answers a
+ * perfectly good token that merely lacks the scope to introspect itself with
+ * `403 insufficient_scope`. Collapsing those two into `authFailed` would page
+ * somebody at 3am over a `read_registry` token that is working exactly as
+ * intended. The 403 is reported as `noExpiry` instead — the credential is
+ * *unmonitorable*, which is this model's existing name for that, and it is a
+ * fixable configuration fact that belongs in a review rather than a nightly
+ * alert.
+ */
+async function probeGitlabPat(
+  secret: string,
+  globalArgs: GlobalArgs,
+  now: Date,
+): Promise<ProbeResult> {
+  const base = globalArgs.gitlabBaseUrl.replace(/\/+$/, "");
+  const url = `${base}/api/v4/personal_access_tokens/self`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: {
+        "PRIVATE-TOKEN": secret,
+        "Accept": "application/json",
+      },
+      signal: AbortSignal.timeout(globalArgs.timeoutMs),
+    });
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `request failed: ${String(cause)}`,
+    };
+  }
+
+  if (res.status === 401) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        "GitLab refused the token (HTTP 401 — invalid, revoked or expired)",
+    };
+  }
+  if (res.status === 403) {
+    // Authenticated fine; just not allowed to look at itself.
+    return {
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        "token authenticates but lacks the api/read_api scope to read its own " +
+        "expiry (HTTP 403) — unmonitorable until the scope is widened",
+    };
+  }
+  if (!res.ok) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `unexpected HTTP ${res.status}`,
+    };
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await res.json() as Record<string, unknown>;
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `could not parse GitLab's response: ${String(cause)}`,
+    };
+  }
+
+  // A revoked token normally 401s, but an instance can serve the record back
+  // with revoked set. Trusting expires_at alone would then report a dead
+  // credential as healthy for as long as its nominal expiry is in the future.
+  if (body.revoked === true || body.active === false) {
+    return {
+      status: "authFailed",
+      expiresAt: typeof body.expires_at === "string" ? body.expires_at : null,
+      daysRemaining: null,
+      detail: "GitLab reports the token as revoked or inactive",
+    };
+  }
+
+  const exp = parseGitlabExpiryDate(body.expires_at);
+  if (exp === null) {
+    return {
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "token reports no expires_at — unmonitorable by any clock",
+    };
+  }
+  return fromEpoch(exp, now, globalArgs);
+}
+
+/** A probe, normalised to one signature so the dispatch can be exhaustive. */
+type Probe = (
+  secret: string,
+  globalArgs: GlobalArgs,
+  now: Date,
+) => ProbeResult | Promise<ProbeResult>;
+
+/**
+ * Resolve a probe kind to its implementation.
+ *
+ * The `never` assignment is the point of this function: adding an entry to
+ * `PROBE_KINDS` without a probe behind it fails the type-check here, rather
+ * than falling through to whichever branch a ternary chain happened to end on
+ * and reporting one credential type's expiry using another's rules.
+ */
+export function probeFor(kind: ProbeKind): Probe {
+  switch (kind) {
+    case "jwt":
+      // Wrapped, not referenced directly: decoding a JWT is local arithmetic
+      // and takes no globalArgs beyond the thresholds.
+      return (secret, globalArgs, now) => probeJwt(secret, now, globalArgs);
+    case "github-pat":
+      return (secret, globalArgs, now) =>
+        probeGithubPat(secret, globalArgs, now);
+    case "gitlab-pat":
+      return (secret, globalArgs, now) =>
+        probeGitlabPat(secret, globalArgs, now);
+    default: {
+      const unreachable: never = kind;
+      throw new Error(`no probe implemented for kind: ${String(unreachable)}`);
+    }
+  }
+}
+
 export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.08.19.2",
+  version: "2026.08.19.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     "credential": {
@@ -456,9 +625,15 @@ export const model = {
         let soonestId: string | null = null;
 
         for (const cred of globalArgs.credentials) {
-          const result = cred.kind === "jwt"
-            ? probeJwt(cred.secret, now, globalArgs)
-            : await probeGithubPat(cred.secret, globalArgs, now);
+          // A switch rather than a ternary chain: the compiler now fails the
+          // build if a probe kind is added to PROBE_KINDS without a probe
+          // behind it, instead of quietly routing it to whichever branch
+          // happened to be last.
+          const result = await probeFor(cred.kind)(
+            cred.secret,
+            globalArgs,
+            now,
+          );
 
           counts[result.status] += 1;
           outcomes.push({
