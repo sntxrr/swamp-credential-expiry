@@ -52,6 +52,7 @@ import { z } from "npm:zod@4";
 
 /** How a credential's expiry can be discovered. */
 export const PROBE_KINDS = ["jwt", "github-pat", "gitlab-pat"] as const;
+/** One of the supported probe kinds, narrowed from {@link PROBE_KINDS}. */
 export type ProbeKind = typeof PROBE_KINDS[number];
 
 /**
@@ -68,6 +69,7 @@ export const STATUSES = [
   "unreachable",
   "ok",
 ] as const;
+/** One of the reportable outcomes, narrowed from {@link STATUSES}. */
 export type Status = typeof STATUSES[number];
 
 const CredentialInputSchema = z.object({
@@ -154,6 +156,10 @@ const AuditSchema = z.object({
   summary: z.string(),
 });
 
+/**
+ * The subset of swamp's structured logger this model uses. Declared locally
+ * rather than imported so the module stays dependency-free apart from zod.
+ */
 export type Logger = {
   info: (msg: string, fields?: Record<string, unknown>) => void;
   warn: (msg: string, fields?: Record<string, unknown>) => void;
@@ -553,11 +559,16 @@ export function probeFor(kind: ProbeKind): Probe {
   }
 }
 
+/**
+ * The credential-expiry model: a single read-only `audit` method that probes
+ * every configured credential, writes one `credential` resource each plus an
+ * `audit` summary, and refuses the whole run rather than report a partial one.
+ */
 export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.08.19.3",
+  version: "2026.08.19.4",
   globalArguments: GlobalArgsSchema,
   resources: {
     "credential": {
