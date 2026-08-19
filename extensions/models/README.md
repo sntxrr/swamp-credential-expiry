@@ -17,9 +17,27 @@ create, rotate or revoke anything.
 |---|---|
 | `jwt` | Decodes the `exp` claim locally. No network call, no verification — verification is the server's job. |
 | `github-pat` | `GET {apiBaseUrl}/user` and reads the `github-authentication-token-expiration` **response header**. |
+| `gitlab-pat` | `GET {gitlabBaseUrl}/api/v4/personal_access_tokens/self` and reads `expires_at` from the body. |
 
 The GitHub expiry is a header, not a body field, which is why that probe looks like a
 liveness check rather than an API call for data. A token with no expiry simply omits it.
+
+The GitLab probe works for **project and group access tokens too** — GitLab implements
+both as personal tokens belonging to a bot user, so they answer the same endpoint.
+
+Two GitLab-specific details worth knowing, because both would otherwise produce a wrong
+alert:
+
+- **`403` is not a dead credential.** GitLab answers an invalid, revoked or expired token
+  with `401`, but answers a perfectly good token that merely lacks the `api`/`read_api`
+  scope to introspect *itself* with `403 insufficient_scope`. Collapsing the two into
+  `authFailed` would page somebody over a `read_registry` token that is working exactly as
+  intended, so a `403` is reported as `noExpiry` — unmonitorable, and fixable by widening
+  the scope.
+- **`expires_at` is a bare date**, so the moment of death is chosen rather than read. It is
+  anchored to UTC midnight at the *start* of that date, the earliest instant the token
+  could stop working. Anchoring to the end of the day would buy a day of headroom that may
+  not exist.
 
 ## Statuses
 
@@ -78,8 +96,13 @@ globalArguments:
       kind: github-pat
       secret: '${{ vault.get(store, sweep/pat) }}'
       note: the weekly sweep alerts only on success, so expiry is silent
+    - id: gitlab/mirror-sync
+      kind: gitlab-pat
+      secret: '${{ vault.get(store, mirror/token) }}'
+      note: project access token the nightly mirror pushes with
   warnDays: [30, 14, 7]
   criticalDays: 3
+  gitlabBaseUrl: https://gitlab.example.com
 ```
 
 Always supply `secret` through `vault.get()`. The value is marked sensitive, is never
