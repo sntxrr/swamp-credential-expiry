@@ -1,0 +1,20 @@
+manifestVersion: 1
+
+name: "@sntxrr/credential-expiry"
+version: "2026.08.19.1"
+description: "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress"
+repository: "https://github.com/sntxrr/swamp-credential-expiry"
+
+models:
+  - credential_expiry.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+labels:
+  - credentials
+  - secrets
+  - expiry
+  - monitoring
+  - security
