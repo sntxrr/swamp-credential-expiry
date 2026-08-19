@@ -83,6 +83,17 @@ A 90-day credential therefore produces four notifications in its life rather tha
 
 ## Usage
 
+### Install
+
+```bash
+swamp extension pull @sntxrr/credential-expiry
+```
+
+### Define what to watch
+
+One entry per credential. The `id` should match the manifest entry it
+corresponds to, so a finding points straight at the thing that will break.
+
 ```yaml
 type: '@sntxrr/credential-expiry'
 name: credential-expiry
@@ -102,22 +113,94 @@ globalArguments:
       note: project access token the nightly mirror pushes with
   warnDays: [30, 14, 7]
   criticalDays: 3
-  gitlabBaseUrl: https://gitlab.example.com
 ```
 
-Always supply `secret` through `vault.get()`. The value is marked sensitive, is never
-logged, and is never written to a resource — only the id, the expiry and the status leave
-the method.
+Always supply `secret` through `vault.get()`. The value is marked sensitive, is
+never logged, and is never written to a resource — only the id, the expiry and
+the status leave the method.
+
+### Run an audit
+
+```bash
+swamp model @sntxrr/credential-expiry method run audit credential-expiry
+
+# the whole picture, worst first
+swamp model get credential-expiry --json
+```
+
+### Ask the questions that matter
+
+The point of separate statuses is that each one supports a different question.
+
+```bash
+# what breaks in the next fortnight?
+swamp data query credential-expiry 'attributes.daysRemaining < 14'
+
+# what is already broken right now?
+swamp data query credential-expiry 'attributes.status == "authFailed"'
+
+# what can no clock ever warn us about? (the standing design debt)
+swamp data query credential-expiry 'attributes.status == "noExpiry"'
+```
+
+### Schedule it, and notify only when it matters
+
+Gate the notify step on `notifyToday`, not on `actionable` — see the section
+above for why the difference is the whole point.
+
+```yaml
+name: credential-expiry-daily
+steps:
+  - name: audit
+    model: credential-expiry
+    method: audit
+
+  - name: notify
+    model: apprise
+    method: notify
+    if: '${{ data.latest("credential-expiry", "audit").attributes.notifyToday }}'
+    inputs:
+      title: '${{ data.latest("credential-expiry", "audit").attributes.notifyReason }}'
+      body: '${{ data.latest("credential-expiry", "audit").attributes.summary }}'
+```
+
+### Self-managed and Enterprise instances
+
+Both host arguments take the instance root. `gitlabBaseUrl` must **not** include
+the `/api/v4` suffix — the probe appends it.
+
+```yaml
+globalArguments:
+  apiBaseUrl: https://github.example.com/api/v3
+  gitlabBaseUrl: https://gitlab.example.com
+  timeoutMs: 15000
+```
 
 ## Resources
 
-`credential` — one per probed credential: `status`, `expiresAt`, `daysRemaining`, `note`,
-`detail`. Named by the credential's `id`, so it maps straight onto a manifest entry.
+`credential` — one per probed credential: `status`, `expiresAt`, `daysRemaining`,
+`note`, `detail`. Named by the credential's `id`, normalised into a safe instance
+name, so it maps straight onto a manifest entry. Two ids that would normalise to
+the same name abort the run rather than silently overwrite one another.
 
-`audit` — written as instance `current`. Counts per status, `soonestDays` / `soonestId`, an
-`actionable` boolean, and a `summary` string of one line per non-ok credential, ready to drop
-into a notification body.
+`audit` — written as instance `current`. Counts per status, `soonestDays` /
+`soonestId`, the `actionable` and `notifyToday` booleans, `notifyReason`, and a
+`summary` string of one line per non-ok credential, ready to drop into a
+notification body.
 
-Gate a notification on `actionable`, not on a raw count. `daysRemaining` is floored, never
-rounded: 0.9 days left reads as `0`, because rounding up would let a credential expire on a
-day the report called safe.
+`daysRemaining` is floored, never rounded: 0.9 days left reads as `0`, because
+rounding up would let a credential expire on a day the report called safe.
+
+## Development
+
+```bash
+~/.swamp/deno/deno check extensions/models/credential_expiry.ts
+~/.swamp/deno/deno test --allow-net extensions/models/credential_expiry_test.ts
+```
+
+Tests mock `fetch`; there are no live calls, and no probe in this model can
+mutate anything.
+
+## License
+
+MIT
