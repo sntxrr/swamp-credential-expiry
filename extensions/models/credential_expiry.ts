@@ -205,11 +205,14 @@ function fromEpoch(
   };
 }
 
-async function probeJwt(
+// Not async: decoding a JWT is local arithmetic, no I/O. Keeping it sync makes
+// that visible at the call site -- this probe cannot hang, time out, or be
+// affected by the network, unlike every other probe here.
+function probeJwt(
   secret: string,
   now: Date,
   policy: { warnDays: number[]; criticalDays: number },
-): Promise<ProbeResult> {
+): ProbeResult {
   const exp = decodeJwtExp(secret);
   if (exp === "malformed") {
     // Not "unreachable": nothing was contacted. A value that does not parse as
@@ -350,7 +353,7 @@ export const model = {
 
         for (const cred of globalArgs.credentials) {
           const result = cred.kind === "jwt"
-            ? await probeJwt(cred.secret, now, globalArgs)
+            ? probeJwt(cred.secret, now, globalArgs)
             : await probeGithubPat(cred.secret, globalArgs, now);
 
           counts[result.status] += 1;
@@ -398,7 +401,8 @@ export const model = {
         // `noExpiry` is deliberately NOT actionable. It is a standing design
         // debt that belongs in a review, not a nightly page — and a page that
         // fires every night over an unchanged fact is one that gets muted.
-        const actionable = counts.authFailed + counts.expired + counts.critical +
+        const actionable =
+          counts.authFailed + counts.expired + counts.critical +
               counts.warn + counts.unreachable > 0;
 
         logger.info(
