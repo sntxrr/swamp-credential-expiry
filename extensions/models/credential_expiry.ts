@@ -51,7 +51,12 @@
 import { z } from "npm:zod@4";
 
 /** How a credential's expiry can be discovered. */
-export const PROBE_KINDS = ["jwt", "github-pat", "gitlab-pat"] as const;
+export const PROBE_KINDS = [
+  "jwt",
+  "github-pat",
+  "gitlab-pat",
+  "pve-token",
+] as const;
 /** One of the supported probe kinds, narrowed from {@link PROBE_KINDS}. */
 export type ProbeKind = typeof PROBE_KINDS[number];
 
@@ -79,7 +84,8 @@ const CredentialInputSchema = z.object({
   kind: z.enum(PROBE_KINDS).describe(
     "How to read this credential's expiry. `jwt` decodes the exp claim; " +
       "`github-pat` reads GitHub's token-expiration response header; " +
-      "`gitlab-pat` reads expires_at from GitLab's token self-introspection endpoint.",
+      "`gitlab-pat` reads expires_at from GitLab's token self-introspection endpoint; " +
+      "`pve-token` reads the Proxmox VE user record, which embeds each token's expire.",
   ),
   secret: z.string().min(1).meta({ sensitive: true }).describe(
     "The credential itself. Supply via vault.get() — never inline. This is the same value the consuming job uses, deliberately: see module docs.",
@@ -104,6 +110,14 @@ const GlobalArgsSchema = z.object({
   ),
   gitlabBaseUrl: z.string().url().default("https://gitlab.com").describe(
     "GitLab instance base URL, for `gitlab-pat` probes, without the /api/v4 suffix. Override for self-managed.",
+  ),
+  pveBaseUrl: z.string().url().default("https://pve.example.invalid").describe(
+    "Proxmox VE base URL, for `pve-token` probes, without the /api2/json suffix. " +
+      "There is no sensible default -- the placeholder is deliberately unroutable so a " +
+      "missing override fails as `unreachable` rather than silently probing somewhere real. " +
+      "Point it at a reverse proxy holding a publicly-trusted certificate: a PVE node's own " +
+      "cluster CA omits the keyUsage extension, which OpenSSL 3 and rustls both reject, so " +
+      "hitting port 8006 directly cannot be made to validate.",
   ),
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Abort any single probe request after this long.",
@@ -533,6 +547,147 @@ type Probe = (
 ) => ProbeResult | Promise<ProbeResult>;
 
 /**
+ * Parse a Proxmox API token into the two identifiers the API needs.
+ *
+ * The wire format is `user@realm!tokenid=<uuid>`. Only the part after `=` is
+ * secret; the rest is an address, which is why this returns it for use in a URL
+ * and in a detail string without redacting anything.
+ *
+ * Exported for tests.
+ */
+export function parsePveToken(
+  secret: string,
+): { userid: string; tokenid: string } | null {
+  const bang = secret.indexOf("!");
+  const eq = secret.indexOf("=", bang + 1);
+  if (bang <= 0 || eq <= bang + 1) return null;
+  const userid = secret.slice(0, bang);
+  const tokenid = secret.slice(bang + 1, eq);
+  if (!userid.includes("@") || tokenid.length === 0) return null;
+  return { userid, tokenid };
+}
+
+/**
+ * Proxmox keeps a token's expiry server-side -- there is nothing to decode out
+ * of the value itself -- so this reads it back from the API.
+ *
+ * It reads `GET /access/users/{userid}`, NOT
+ * `GET /access/users/{userid}/token/{tokenid}`. The dedicated token endpoint
+ * needs `User.Modify`, which is permission to *create and delete* this user's
+ * tokens and is far too much to hand a monitor. The user record answers with a
+ * `tokens` map that embeds each token's `expire` and is readable with nothing
+ * but `Sys.Audit` -- so a `PVEAuditor` token can report on itself, and on every
+ * other token in the cluster, while remaining unable to change anything.
+ *
+ * `expire: 0` means never. That is Proxmox's encoding, not a missing field, and
+ * it maps to `noExpiry` rather than to an epoch in 1970.
+ *
+ * A 403 is reported as `noExpiry`, not `authFailed`, for the same reason the
+ * GitLab probe does: the credential works, it simply lacks `Sys.Audit` and so is
+ * *unmonitorable*. That is a configuration fact for a review, not an outage to
+ * wake somebody for. Only 401 means the token was refused.
+ */
+async function probePveToken(
+  secret: string,
+  globalArgs: GlobalArgs,
+  now: Date,
+): Promise<ProbeResult> {
+  const parsed = parsePveToken(secret);
+  if (parsed === null) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "secret is not in Proxmox `user@realm!tokenid=<secret>` form",
+    };
+  }
+  const base = globalArgs.pveBaseUrl.replace(/\/+$/, "");
+  const url = `${base}/api2/json/access/users/${
+    encodeURIComponent(parsed.userid)
+  }`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { "Authorization": `PVEAPIToken=${secret}` },
+      signal: AbortSignal.timeout(globalArgs.timeoutMs),
+    });
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `request failed: ${String(cause)}`,
+    };
+  }
+
+  if (res.status === 401) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "Proxmox refused the token (HTTP 401)",
+    };
+  }
+  if (res.status === 403) {
+    return {
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        `token authenticates but cannot read /access/users/${parsed.userid} ` +
+        "(HTTP 403) -- it needs Sys.Audit to report its own expiry",
+    };
+  }
+  if (!res.ok) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `unexpected HTTP ${res.status}`,
+    };
+  }
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `response was not JSON: ${String(cause)}`,
+    };
+  }
+
+  const tokens = (body as { data?: { tokens?: Record<string, unknown> } })
+    ?.data?.tokens;
+  const entry = tokens?.[parsed.tokenid] as { expire?: unknown } | undefined;
+  if (entry === undefined) {
+    // The user exists and answered, but this tokenid is not among its tokens.
+    // That is a deleted or renamed token being read from a stale config -- an
+    // outage in waiting, and emphatically not "no expiry".
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `no token '${parsed.tokenid}' on user ${parsed.userid} -- ` +
+        "deleted, renamed, or the manifest is stale",
+    };
+  }
+
+  const expire = entry.expire;
+  if (typeof expire !== "number" || expire === 0) {
+    return {
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "token authenticates but is configured to never expire",
+    };
+  }
+  return fromEpoch(expire, now, globalArgs);
+}
+
+/**
  * Resolve a probe kind to its implementation.
  *
  * The `never` assignment is the point of this function: adding an entry to
@@ -552,6 +707,9 @@ export function probeFor(kind: ProbeKind): Probe {
     case "gitlab-pat":
       return (secret, globalArgs, now) =>
         probeGitlabPat(secret, globalArgs, now);
+    case "pve-token":
+      return (secret, globalArgs, now) =>
+        probePveToken(secret, globalArgs, now);
     default: {
       const unreachable: never = kind;
       throw new Error(`no probe implemented for kind: ${String(unreachable)}`);
@@ -568,7 +726,7 @@ export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.08.19.4",
+  version: "2026.09.08.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     "credential": {
