@@ -93,6 +93,13 @@ const CredentialInputSchema = z.object({
   note: z.string().default("").describe(
     "Free text carried onto the resource, e.g. which job would break. Shown in alerts.",
   ),
+  subject: z.string().default("").describe(
+    "`pve-token` only: the token to REPORT ON, as `user@realm!tokenid`, when it is not the " +
+      "one authenticating. Leave unset to have the credential report on itself. This exists " +
+      "because a least-privilege Proxmox token has no Sys.Audit and so cannot read its own " +
+      "expiry -- granting it that to make it self-monitoring would widen the blast radius " +
+      "the scoping was for. A separate read-only credential reads on its behalf instead.",
+  ),
 });
 
 const GlobalArgsSchema = z.object({
@@ -544,6 +551,7 @@ type Probe = (
   secret: string,
   globalArgs: GlobalArgs,
   now: Date,
+  subject?: string,
 ) => ProbeResult | Promise<ProbeResult>;
 
 /**
@@ -564,6 +572,26 @@ export function parsePveToken(
   const userid = secret.slice(0, bang);
   const tokenid = secret.slice(bang + 1, eq);
   if (!userid.includes("@") || tokenid.length === 0) return null;
+  return { userid, tokenid };
+}
+
+/**
+ * Parse a `user@realm!tokenid` subject -- the same shape as a token's value with
+ * the secret half absent, because a subject names a token rather than proving
+ * anything about it.
+ *
+ * Exported for tests.
+ */
+export function parsePveSubject(
+  subject: string,
+): { userid: string; tokenid: string } | null {
+  const bang = subject.indexOf("!");
+  if (bang <= 0 || bang === subject.length - 1) return null;
+  const userid = subject.slice(0, bang);
+  const tokenid = subject.slice(bang + 1);
+  // A subject carrying an '=' is a SECRET pasted where an identifier belongs.
+  // Reject it rather than silently storing it in a resource attribute.
+  if (!userid.includes("@") || tokenid.includes("=")) return null;
   return { userid, tokenid };
 }
 
@@ -591,14 +619,42 @@ async function probePveToken(
   secret: string,
   globalArgs: GlobalArgs,
   now: Date,
+  subject?: string,
 ): Promise<ProbeResult> {
-  const parsed = parsePveToken(secret);
-  if (parsed === null) {
+  // The authenticating token must always parse -- that is what goes in the header.
+  if (parsePveToken(secret) === null) {
     return {
       status: "authFailed",
       expiresAt: null,
       daysRemaining: null,
       detail: "secret is not in Proxmox `user@realm!tokenid=<secret>` form",
+    };
+  }
+  // When one credential reads on another's behalf, say so on every result.
+  // Without it a reader cannot tell whether a reported expiry belongs to the
+  // credential named by `id` or to the one that authenticated -- and those
+  // differ precisely when the entry matters most.
+  const onBehalfOf = (r: ProbeResult): ProbeResult =>
+    subject && subject.length > 0
+      ? {
+        ...r,
+        detail:
+          `${r.detail} (read by the probe credential on behalf of ${subject})`,
+      }
+      : r;
+
+  // What we REPORT ON is the subject when given, otherwise the token itself.
+  // Deriving it from the secret by default keeps the simple case simple; naming
+  // a subject is what lets one read-only credential cover a whole cluster.
+  const parsed = subject && subject.length > 0
+    ? parsePveSubject(subject)
+    : parsePveToken(secret);
+  if (parsed === null) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "`subject` is not in Proxmox `user@realm!tokenid` form",
     };
   }
   const base = globalArgs.pveBaseUrl.replace(/\/+$/, "");
@@ -677,14 +733,14 @@ async function probePveToken(
 
   const expire = entry.expire;
   if (typeof expire !== "number" || expire === 0) {
-    return {
+    return onBehalfOf({
       status: "noExpiry",
       expiresAt: null,
       daysRemaining: null,
-      detail: "token authenticates but is configured to never expire",
-    };
+      detail: "token is configured to never expire",
+    });
   }
-  return fromEpoch(expire, now, globalArgs);
+  return onBehalfOf(fromEpoch(expire, now, globalArgs));
 }
 
 /**
@@ -708,8 +764,8 @@ export function probeFor(kind: ProbeKind): Probe {
       return (secret, globalArgs, now) =>
         probeGitlabPat(secret, globalArgs, now);
     case "pve-token":
-      return (secret, globalArgs, now) =>
-        probePveToken(secret, globalArgs, now);
+      return (secret, globalArgs, now, subject) =>
+        probePveToken(secret, globalArgs, now, subject);
     default: {
       const unreachable: never = kind;
       throw new Error(`no probe implemented for kind: ${String(unreachable)}`);
@@ -726,7 +782,7 @@ export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.09.08.1",
+  version: "2026.09.08.2",
   // Purely additive: a fourth probe kind and the `pveBaseUrl` global argument
   // that serves it. No stored attribute changes shape, so the migration is a
   // no-op -- but it has to be DECLARED, or existing instances pin themselves to
@@ -741,6 +797,12 @@ export const model = {
       toVersion: "2026.09.08.1",
       description:
         "Adds the `pve-token` probe kind and the `pveBaseUrl` global argument. Nothing to migrate: the credential and audit resource schemas are unchanged, and existing `jwt`, `github-pat` and `gitlab-pat` entries keep their behaviour exactly. To monitor a Proxmox token, add an entry with `kind: pve-token` whose secret is the full `user@realm!tokenid=<secret>` string, and set `pveBaseUrl` to a reverse proxy holding a publicly-trusted certificate -- a PVE cluster CA omits keyUsage, which OpenSSL 3 and rustls both reject, so port 8006 direct cannot validate.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.08.2",
+      description:
+        "Adds the optional `subject` field, so a `pve-token` entry can report on a token OTHER than the one it authenticates with. Nothing to migrate -- `subject` defaults to empty, and an empty subject keeps the previous behaviour of deriving the reported token from the secret. Set it when a least-privilege token cannot read its own expiry: the entry's `secret` becomes a read-only credential holding Sys.Audit, and `subject` names the token being watched.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -819,6 +881,7 @@ export const model = {
             cred.secret,
             globalArgs,
             now,
+            cred.subject,
           );
 
           counts[result.status] += 1;

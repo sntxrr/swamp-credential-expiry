@@ -526,3 +526,93 @@ Deno.test("pve-token treats a non-numeric expire as noExpiry rather than trustin
   assertEquals(res.status, "noExpiry");
   assertEquals(res.daysRemaining, null);
 });
+
+import { parsePveSubject } from "./credential_expiry.ts";
+
+Deno.test("parsePveSubject accepts an identifier and rejects a pasted secret", () => {
+  assertEquals(parsePveSubject("terraform@pve!tf-proxmox-docker"), {
+    userid: "terraform@pve",
+    tokenid: "tf-proxmox-docker",
+  });
+  // A subject carrying '=' is a SECRET where an identifier belongs. Accepting it
+  // would write credential material into a resource attribute.
+  assertEquals(
+    parsePveSubject("terraform@pve!tok=00000000-1111-2222-3333-444444444444"),
+    null,
+  );
+  assertEquals(parsePveSubject("no-realm!tok"), null);
+  assertEquals(parsePveSubject("user@pve!"), null);
+  assertEquals(parsePveSubject("user@pve"), null);
+});
+
+Deno.test("pve-token with a subject reports the SUBJECT's expiry, not its own", async () => {
+  // The regression this field exists for: authenticating as the monitor while
+  // reporting on the provisioning token. Reading the monitor's own row here
+  // would report `noExpiry` for a credential that actually lapses.
+  let seen = "";
+  const res = await withFetch(
+    (url) => {
+      seen = url;
+      return pveBody({
+        expiry: { expire: 0 }, // the authenticating token -- never expires
+        "tf-proxmox-docker": { expire: 1_794_873_600 }, // the subject
+      });
+    },
+    () =>
+      Promise.resolve(
+        probeFor("pve-token")(
+          PVE_SECRET,
+          PVE,
+          NOW,
+          "terraform@pve!tf-proxmox-docker",
+        ),
+      ),
+  );
+  // looked up the SUBJECT's user, not monitor@pve
+  assertEquals(
+    seen,
+    "https://pve.example.com/api2/json/access/users/terraform%40pve",
+  );
+  assertEquals(res.status, "ok");
+  assertEquals(res.expiresAt, new Date(1_794_873_600 * 1000).toISOString());
+  // and says whose expiry it is
+  assertEquals(
+    res.detail.includes("on behalf of terraform@pve!tf-proxmox-docker"),
+    true,
+  );
+});
+
+Deno.test("pve-token with no subject still reports its own expiry", async () => {
+  const res = await withFetch(
+    () => pveBody({ expiry: { expire: 1_794_873_600 } }),
+    () => Promise.resolve(probeFor("pve-token")(PVE_SECRET, PVE, NOW)),
+  );
+  assertEquals(res.status, "ok");
+  assertEquals(res.detail.includes("on behalf of"), false);
+});
+
+Deno.test("pve-token rejects a malformed subject without falling back to self", async () => {
+  // Falling back would silently report the WRONG credential as healthy.
+  const res = await withFetch(
+    () => pveBody({ expiry: { expire: 0 } }),
+    () =>
+      Promise.resolve(probeFor("pve-token")(PVE_SECRET, PVE, NOW, "garbage")),
+  );
+  assertEquals(res.status, "authFailed");
+});
+
+Deno.test("pve-token reports a subject missing from its user as authFailed", async () => {
+  const res = await withFetch(
+    () => pveBody({ "some-other": { expire: 0 } }),
+    () =>
+      Promise.resolve(
+        probeFor("pve-token")(
+          PVE_SECRET,
+          PVE,
+          NOW,
+          "terraform@pve!tf-proxmox-docker",
+        ),
+      ),
+  );
+  assertEquals(res.status, "authFailed");
+});
