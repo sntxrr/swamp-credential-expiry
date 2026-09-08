@@ -18,12 +18,30 @@ create, rotate or revoke anything.
 | `jwt` | Decodes the `exp` claim locally. No network call, no verification — verification is the server's job. |
 | `github-pat` | `GET {apiBaseUrl}/user` and reads the `github-authentication-token-expiration` **response header**. |
 | `gitlab-pat` | `GET {gitlabBaseUrl}/api/v4/personal_access_tokens/self` and reads `expires_at` from the body. |
+| `pve-token` | `GET {pveBaseUrl}/api2/json/access/users/{userid}` and reads `tokens[tokenid].expire` from the body. |
 
 The GitHub expiry is a header, not a body field, which is why that probe looks like a
 liveness check rather than an API call for data. A token with no expiry simply omits it.
 
 The GitLab probe works for **project and group access tokens too** — GitLab implements
 both as personal tokens belonging to a bot user, so they answer the same endpoint.
+
+The Proxmox probe reads the **user** record rather than
+`/access/users/{userid}/token/{tokenid}`. The dedicated token endpoint requires
+`User.Modify`, which is permission to create and delete that user's tokens — far too much
+to hand a monitor. The user record embeds the same `expire` and needs only `Sys.Audit`, so
+a `PVEAuditor` token can report on itself *and on every other token in the cluster* while
+remaining unable to change anything. `expire: 0` is Proxmox's encoding for "never" and maps
+to `noExpiry`, not to an epoch in 1970.
+
+Two Proxmox-specific cautions:
+
+- **`pveBaseUrl` must point at a reverse proxy with a publicly-trusted certificate.** A PVE
+  node's own cluster CA omits the `keyUsage` extension, which OpenSSL 3 and rustls both
+  reject, so port 8006 direct cannot be made to validate — and the fix is a trusted cert in
+  front, not disabling verification.
+- **A `privsep=0` token needs no ACL of its own**, so its effective permission is whatever
+  its *user* holds. Do not infer a token's reach from `pveum acl list`.
 
 Two GitLab-specific details worth knowing, because both would otherwise produce a wrong
 alert:
@@ -111,6 +129,11 @@ globalArguments:
       kind: gitlab-pat
       secret: '${{ vault.get(store, mirror/token) }}'
       note: project access token the nightly mirror pushes with
+    - id: pve-token/builder@pve!provisioner
+      kind: pve-token
+      secret: '${{ vault.get(store, pve/provisioner) }}'
+      note: the only credential the VM provisioner authenticates with
+  pveBaseUrl: https://pve.example.com
   warnDays: [30, 14, 7]
   criticalDays: 3
 ```

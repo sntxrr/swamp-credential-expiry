@@ -45,7 +45,10 @@ Deno.test("decodeJwtExp treats a non-numeric exp as malformed", () => {
 Deno.test("parseGithubExpiryHeader handles GitHub's format", () => {
   // Real value observed from GET /user: "2026-11-11 23:58:42 UTC"
   const got = parseGithubExpiryHeader("2026-11-11 23:58:42 UTC");
-  assertEquals(new Date((got as number) * 1000).toISOString(), "2026-11-11T23:58:42.000Z");
+  assertEquals(
+    new Date((got as number) * 1000).toISOString(),
+    "2026-11-11T23:58:42.000Z",
+  );
 });
 
 Deno.test("parseGithubExpiryHeader returns null when absent or unparseable", () => {
@@ -76,10 +79,16 @@ import { preflight, resourceNameFor } from "./credential_expiry.ts";
 
 Deno.test("resourceNameFor strips characters unsafe in a storage key", () => {
   // Manifest ids are path-shaped; instance names must not be.
-  assertEquals(resourceNameFor("connect-token/deploy-bot"), "connect-token-deploy-bot");
+  assertEquals(
+    resourceNameFor("connect-token/deploy-bot"),
+    "connect-token-deploy-bot",
+  );
   assertEquals(resourceNameFor("pat/sweep"), "pat-sweep");
   assertEquals(resourceNameFor("already.safe_id-1"), "already.safe_id-1");
-  assertEquals(resourceNameFor("/leading/and/trailing/"), "leading-and-trailing");
+  assertEquals(
+    resourceNameFor("/leading/and/trailing/"),
+    "leading-and-trailing",
+  );
 });
 
 Deno.test("preflight passes a clean config", () => {
@@ -117,16 +126,34 @@ const P = { warnDays: [30, 14, 7], criticalDays: 3 };
 Deno.test("shouldNotify fires on the day a threshold is crossed, not before or after", () => {
   // The whole point: a 29-day credential is actionable for 29 days running, and
   // an alert that repeats an unchanged fact daily for a month gets filtered.
-  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 30 }], P).notify, true);
-  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 29 }], P).notify, false);
-  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 15 }], P).notify, false);
-  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 14 }], P).notify, true);
-  assertEquals(shouldNotify([{ status: "warn", daysRemaining: 7 }], P).notify, true);
+  assertEquals(
+    shouldNotify([{ status: "warn", daysRemaining: 30 }], P).notify,
+    true,
+  );
+  assertEquals(
+    shouldNotify([{ status: "warn", daysRemaining: 29 }], P).notify,
+    false,
+  );
+  assertEquals(
+    shouldNotify([{ status: "warn", daysRemaining: 15 }], P).notify,
+    false,
+  );
+  assertEquals(
+    shouldNotify([{ status: "warn", daysRemaining: 14 }], P).notify,
+    true,
+  );
+  assertEquals(
+    shouldNotify([{ status: "warn", daysRemaining: 7 }], P).notify,
+    true,
+  );
 });
 
 Deno.test("shouldNotify fires every day once inside criticalDays", () => {
   for (const d of [3, 2, 1, 0]) {
-    assertEquals(shouldNotify([{ status: "critical", daysRemaining: d }], P).notify, true);
+    assertEquals(
+      shouldNotify([{ status: "critical", daysRemaining: d }], P).notify,
+      true,
+    );
   }
 });
 
@@ -139,9 +166,15 @@ Deno.test("shouldNotify always fires for outage-shaped statuses", () => {
 });
 
 Deno.test("shouldNotify stays quiet for ok and for noExpiry", () => {
-  assertEquals(shouldNotify([{ status: "ok", daysRemaining: 89 }], P).notify, false);
+  assertEquals(
+    shouldNotify([{ status: "ok", daysRemaining: 89 }], P).notify,
+    false,
+  );
   // noExpiry is standing design debt for a review, never a nightly page.
-  assertEquals(shouldNotify([{ status: "noExpiry", daysRemaining: null }], P).notify, false);
+  assertEquals(
+    shouldNotify([{ status: "noExpiry", daysRemaining: null }], P).notify,
+    false,
+  );
 });
 
 Deno.test("shouldNotify reports the worst reason when several apply", () => {
@@ -324,4 +357,153 @@ Deno.test("probeFor covers every declared probe kind", () => {
   for (const kind of PROBE_KINDS) {
     assertEquals(typeof probeFor(kind), "function");
   }
+});
+
+import { parsePveToken } from "./credential_expiry.ts";
+
+Deno.test("parsePveToken splits the wire format into its addressable parts", () => {
+  assertEquals(parsePveToken("monitor@pve!expiry=abc-123"), {
+    userid: "monitor@pve",
+    tokenid: "expiry",
+  });
+  // a uuid secret contains no '!' or '=', so the first of each is unambiguous
+  assertEquals(
+    parsePveToken(
+      "terraform@pve!tf-proxmox-docker=00000000-1111-2222-3333-444444444444",
+    ),
+    { userid: "terraform@pve", tokenid: "tf-proxmox-docker" },
+  );
+});
+
+Deno.test("parsePveToken rejects anything that is not user@realm!tokenid=secret", () => {
+  assertEquals(parsePveToken("no-bang-here=secret"), null);
+  assertEquals(parsePveToken("missing-realm!tok=secret"), null); // no '@'
+  assertEquals(parsePveToken("user@pve!=secret"), null); // empty tokenid
+  assertEquals(parsePveToken("user@pve!tok"), null); // no '='
+  assertEquals(parsePveToken("!tok=secret"), null); // empty userid
+});
+
+const PVE = {
+  credentials: [],
+  warnDays: [30, 14, 7],
+  criticalDays: 3,
+  apiBaseUrl: "https://api.github.com",
+  gitlabBaseUrl: "https://gitlab.example.com",
+  pveBaseUrl: "https://pve.example.com",
+  timeoutMs: 15000,
+  // deno-lint-ignore no-explicit-any
+} as any;
+
+const PVE_SECRET = "monitor@pve!expiry=00000000-1111-2222-3333-444444444444";
+
+function pveBody(tokens: Record<string, unknown>): Response {
+  return new Response(JSON.stringify({ data: { tokens } }), { status: 200 });
+}
+
+Deno.test("pve-token reads expire out of the user record, not the token endpoint", async () => {
+  let seen = "";
+  const res = await withFetch(
+    (url) => {
+      seen = url;
+      // 90 days after NOW (2026-11-17T00:00:00Z), well clear of every warn
+      // threshold -- this test is about the URL and the parse, not classify.
+      // Note `warn` fires AT the threshold, so 30 days exactly would be `warn`.
+      return pveBody({ expiry: { expire: 1_794_873_600, privsep: 1 } });
+    },
+    () =>
+      Promise.resolve(
+        probeFor("pve-token")(
+          PVE_SECRET,
+          PVE,
+          new Date("2026-08-19T00:00:00Z"),
+        ),
+      ),
+  );
+  // the user record -- asking for /token/{id} would need User.Modify
+  assertEquals(
+    seen,
+    "https://pve.example.com/api2/json/access/users/monitor%40pve",
+  );
+  assertEquals(res.status, "ok");
+  assertEquals(res.expiresAt, new Date(1_794_873_600 * 1000).toISOString());
+});
+
+Deno.test("pve-token treats expire: 0 as never, not as 1970", async () => {
+  const res = await withFetch(
+    () => pveBody({ expiry: { expire: 0, privsep: 1 } }),
+    () => Promise.resolve(probeFor("pve-token")(PVE_SECRET, PVE, NOW)),
+  );
+  assertEquals(res.status, "noExpiry");
+  assertEquals(res.expiresAt, null);
+});
+
+Deno.test("pve-token reports a missing tokenid as an outage, never as noExpiry", async () => {
+  // A deleted or renamed token read from a stale manifest. Calling this
+  // "no expiry" would report a credential that cannot authenticate as healthy.
+  const res = await withFetch(
+    () => pveBody({ "some-other-token": { expire: 0 } }),
+    () => Promise.resolve(probeFor("pve-token")(PVE_SECRET, PVE, NOW)),
+  );
+  assertEquals(res.status, "authFailed");
+});
+
+Deno.test("pve-token separates 401 (refused) from 403 (unmonitorable)", async () => {
+  const refused = await withFetch(
+    () => new Response("", { status: 401 }),
+    () => Promise.resolve(probeFor("pve-token")(PVE_SECRET, PVE, NOW)),
+  );
+  assertEquals(refused.status, "authFailed");
+
+  // A working token that merely lacks Sys.Audit. Paging over this would be a
+  // false alarm -- same reasoning as the GitLab insufficient_scope case.
+  const unmonitorable = await withFetch(
+    () => new Response("", { status: 403 }),
+    () => Promise.resolve(probeFor("pve-token")(PVE_SECRET, PVE, NOW)),
+  );
+  assertEquals(unmonitorable.status, "noExpiry");
+});
+
+Deno.test("pve-token separates a network failure from a credential failure", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (() => Promise.reject(new Error("boom"))) as typeof fetch;
+  try {
+    const res = await probeFor("pve-token")(PVE_SECRET, PVE, NOW);
+    assertEquals(res.status, "unreachable");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("pve-token rejects a malformed secret before making a request", async () => {
+  let called = false;
+  const res = await withFetch(
+    () => {
+      called = true;
+      return pveBody({});
+    },
+    () => Promise.resolve(probeFor("pve-token")("not-a-pve-token", PVE, NOW)),
+  );
+  assertEquals(res.status, "authFailed");
+  assertEquals(called, false);
+});
+
+Deno.test("a trailing slash on pveBaseUrl does not double the separator", async () => {
+  let seen = "";
+  await withFetch(
+    (url) => {
+      seen = url;
+      return pveBody({ expiry: { expire: 0 } });
+    },
+    () =>
+      Promise.resolve(
+        probeFor("pve-token")(PVE_SECRET, {
+          ...PVE,
+          pveBaseUrl: "https://pve.example.com/",
+        }, NOW),
+      ),
+  );
+  assertEquals(
+    seen,
+    "https://pve.example.com/api2/json/access/users/monitor%40pve",
+  );
 });
