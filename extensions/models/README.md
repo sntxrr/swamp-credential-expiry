@@ -34,6 +34,14 @@ a `PVEAuditor` token can report on itself *and on every other token in the clust
 remaining unable to change anything. `expire: 0` is Proxmox's encoding for "never" and maps
 to `noExpiry`, not to an epoch in 1970.
 
+**A least-privilege token usually cannot report its own expiry**, because reading it needs
+`Sys.Audit` and a provisioning token has no business holding that — granting it to make the
+token self-monitoring would widen the very blast radius the scoping was for. Set `subject`
+instead: the entry's `secret` becomes a separate read-only credential, and `subject` names
+the `user@realm!tokenid` being watched. One such credential can cover every token in a
+cluster. Results say `(read by the probe credential on behalf of ...)` so it is never
+ambiguous whose expiry is being reported.
+
 Two Proxmox-specific cautions:
 
 - **`pveBaseUrl` must point at a reverse proxy with a publicly-trusted certificate.** A PVE
@@ -131,7 +139,9 @@ globalArguments:
       note: project access token the nightly mirror pushes with
     - id: pve-token/builder@pve!provisioner
       kind: pve-token
-      secret: '${{ vault.get(store, pve/provisioner) }}'
+      # authenticates as a read-only monitor, reports on the provisioner
+      secret: '${{ vault.get(store, pve/expiry-monitor) }}'
+      subject: builder@pve!provisioner
       note: the only credential the VM provisioner authenticates with
   pveBaseUrl: https://pve.example.com
   warnDays: [30, 14, 7]
