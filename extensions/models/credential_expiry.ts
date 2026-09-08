@@ -727,6 +727,23 @@ export const model = {
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
   version: "2026.09.08.1",
+  // Purely additive: a fourth probe kind and the `pveBaseUrl` global argument
+  // that serves it. No stored attribute changes shape, so the migration is a
+  // no-op -- but it has to be DECLARED, or existing instances pin themselves to
+  // the version they were created at and quietly never see the new probe.
+  //
+  // `pveBaseUrl` carries a default, so a model that does not set it still
+  // validates. The default is deliberately unroutable rather than a real host,
+  // so an unset override fails as `unreachable` instead of probing somewhere
+  // it was never pointed at.
+  upgrades: [
+    {
+      toVersion: "2026.09.08.1",
+      description:
+        "Adds the `pve-token` probe kind and the `pveBaseUrl` global argument. Nothing to migrate: the credential and audit resource schemas are unchanged, and existing `jwt`, `github-pat` and `gitlab-pat` entries keep their behaviour exactly. To monitor a Proxmox token, add an entry with `kind: pve-token` whose secret is the full `user@realm!tokenid=<secret>` string, and set `pveBaseUrl` to a reverse proxy holding a publicly-trusted certificate -- a PVE cluster CA omits keyUsage, which OpenSSL 3 and rustls both reject, so port 8006 direct cannot validate.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     "credential": {
