@@ -507,3 +507,22 @@ Deno.test("a trailing slash on pveBaseUrl does not double the separator", async 
     "https://pve.example.com/api2/json/access/users/monitor%40pve",
   );
 });
+
+Deno.test("pve-token treats a non-JSON 2xx body as unreachable, not as a credential fault", async () => {
+  const res = await withFetch(
+    () => new Response("<html>proxy error</html>", { status: 200 }),
+    () => Promise.resolve(probeFor("pve-token")(PVE_SECRET, PVE, NOW)),
+  );
+  // A reverse proxy answering 200 with an error page must not read as "expired"
+  // or "authFailed" -- neither says anything true about the credential.
+  assertEquals(res.status, "unreachable");
+});
+
+Deno.test("pve-token treats a non-numeric expire as noExpiry rather than trusting it", async () => {
+  const res = await withFetch(
+    () => pveBody({ expiry: { expire: "1794873600" } }),
+    () => Promise.resolve(probeFor("pve-token")(PVE_SECRET, PVE, NOW)),
+  );
+  assertEquals(res.status, "noExpiry");
+  assertEquals(res.daysRemaining, null);
+});
