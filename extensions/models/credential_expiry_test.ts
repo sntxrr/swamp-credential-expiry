@@ -3,6 +3,8 @@ import { assertEquals } from "jsr:@std/assert@1";
 import {
   classify,
   decodeJwtExp,
+  parseB2Secret,
+  parseB2Subject,
   parseGithubExpiryHeader,
   parseGitlabExpiryDate,
   PROBE_KINDS,
@@ -615,4 +617,177 @@ Deno.test("pve-token reports a subject missing from its user as authFailed", asy
       ),
   );
   assertEquals(res.status, "authFailed");
+});
+
+// ---------------------------------------------------------------------------
+// b2-key
+// ---------------------------------------------------------------------------
+
+const B2 = {
+  credentials: [],
+  warnDays: [30, 14, 7],
+  criticalDays: 3,
+  apiBaseUrl: "https://api.github.com",
+  gitlabBaseUrl: "https://gitlab.example.com",
+  pveBaseUrl: "https://pve.example.com",
+  b2BaseUrl: "https://api.backblazeb2.com",
+  timeoutMs: 15000,
+};
+const B2_SECRET = "002abc0123456780000000099:K002aaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const B2_KEYID = "002abc0123456780000000099";
+
+/** Route the two-call B2 flow: authorize, then list_keys. */
+function b2Fetch(
+  keys: unknown[],
+  opts: { capabilities?: string[]; authStatus?: number } = {},
+) {
+  return (url: string): Response => {
+    if (url.includes("b2_authorize_account")) {
+      if (opts.authStatus && opts.authStatus !== 200) {
+        return new Response("", { status: opts.authStatus });
+      }
+      return new Response(
+        JSON.stringify({
+          accountId: "abc012345678",
+          authorizationToken: "4_token",
+          apiInfo: {
+            storageApi: {
+              apiUrl: "https://api002.backblazeb2.com",
+              capabilities: opts.capabilities ?? ["listKeys", "listBuckets"],
+            },
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response(JSON.stringify({ keys }), { status: 200 });
+  };
+}
+
+Deno.test("b2-key reads expirationTimestamp in MILLISECONDS, not seconds", async () => {
+  // The single most dangerous unit bug available here: B2 reports ms where
+  // Proxmox reports seconds. Treating ms as seconds puts the expiry ~50,000
+  // years out and classifies a key about to lapse as `ok`.
+  const expMs = Date.UTC(2026, 10, 17, 0, 0, 0); // 2026-11-17
+  const res = await withFetch(
+    b2Fetch([{ applicationKeyId: B2_KEYID, expirationTimestamp: expMs }]),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.expiresAt, new Date(expMs).toISOString());
+  assertEquals(res.daysRemaining, 90);
+  assertEquals(res.status, "ok");
+});
+
+Deno.test("b2-key treats a missing listKeys capability as a monitoring gap, not an outage", async () => {
+  // B2 answers 401 both for a refused key and for a good key lacking the
+  // capability. Reading the capability from the authorize response is what
+  // keeps those apart -- one is an outage, the other is not worth paging for.
+  const res = await withFetch(
+    b2Fetch([], { capabilities: ["listBuckets", "readFiles"] }),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "noExpiry");
+  assertEquals(res.detail.includes("lacks the listKeys capability"), true);
+});
+
+Deno.test("b2-key reports a refused key as authFailed", async () => {
+  const res = await withFetch(
+    b2Fetch([], { authStatus: 401 }),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "authFailed");
+});
+
+Deno.test("b2-key reports a key missing from the account as an outage, never as noExpiry", async () => {
+  // An EXPIRED B2 key is deleted outright rather than kept and flagged, so
+  // "absent" is the shape a lapse actually takes. Calling it noExpiry would
+  // report a dead credential as a standing design debt.
+  const res = await withFetch(
+    b2Fetch([{
+      applicationKeyId: "002somethingelse",
+      expirationTimestamp: null,
+    }]),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "authFailed");
+  assertEquals(
+    res.detail.includes("deleted, expired, or the manifest is stale"),
+    true,
+  );
+});
+
+Deno.test("b2-key treats a null expirationTimestamp as noExpiry", async () => {
+  const res = await withFetch(
+    b2Fetch([{ applicationKeyId: B2_KEYID, expirationTimestamp: null }]),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "noExpiry");
+});
+
+Deno.test("b2-key with a subject reports the SUBJECT's key, not its own", async () => {
+  let listUrl = "";
+  const expMs = Date.UTC(2026, 10, 17);
+  const res = await withFetch(
+    (url) => {
+      if (url.includes("b2_list_keys")) listUrl = url;
+      return b2Fetch([{
+        applicationKeyId: "002othertarget",
+        expirationTimestamp: expMs,
+      }])(url);
+    },
+    () =>
+      Promise.resolve(
+        probeFor("b2-key")(B2_SECRET, B2, NOW, "002othertarget"),
+      ),
+  );
+  assertEquals(listUrl.includes("startApplicationKeyId=002othertarget"), true);
+  assertEquals(res.status, "ok");
+  assertEquals(res.detail.includes("on behalf of 002othertarget"), true);
+});
+
+Deno.test("b2-key rejects a malformed secret before making a request", async () => {
+  let called = false;
+  const res = await withFetch(
+    () => {
+      called = true;
+      return new Response("{}", { status: 200 });
+    },
+    () => Promise.resolve(probeFor("b2-key")("no-colon-here", B2, NOW)),
+  );
+  assertEquals(res.status, "authFailed");
+  assertEquals(called, false);
+});
+
+Deno.test("parseB2Secret and parseB2Subject reject a secret pasted as an identifier", () => {
+  assertEquals(parseB2Secret("abc:def"), { keyId: "abc", appKey: "def" });
+  assertEquals(parseB2Secret("abc"), null);
+  assertEquals(parseB2Secret("abc:def:ghi"), null);
+  // a subject must be a bare id -- never a key pair
+  assertEquals(parseB2Subject("002abc"), "002abc");
+  assertEquals(parseB2Subject("002abc:K002secret"), null);
+  assertEquals(parseB2Subject(""), null);
+});
+
+Deno.test("a trailing slash on b2BaseUrl does not double the separator", async () => {
+  let seen = "";
+  await withFetch(
+    (url) => {
+      if (url.includes("b2_authorize_account")) seen = url;
+      return b2Fetch([{
+        applicationKeyId: B2_KEYID,
+        expirationTimestamp: null,
+      }])(url);
+    },
+    () =>
+      Promise.resolve(
+        probeFor("b2-key")(B2_SECRET, {
+          ...B2,
+          b2BaseUrl: "https://api.backblazeb2.com/",
+        }, NOW),
+      ),
+  );
+  assertEquals(
+    seen,
+    "https://api.backblazeb2.com/b2api/v3/b2_authorize_account",
+  );
 });
