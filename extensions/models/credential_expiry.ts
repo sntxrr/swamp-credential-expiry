@@ -56,6 +56,7 @@ export const PROBE_KINDS = [
   "github-pat",
   "gitlab-pat",
   "pve-token",
+  "b2-key",
 ] as const;
 /** One of the supported probe kinds, narrowed from {@link PROBE_KINDS}. */
 export type ProbeKind = typeof PROBE_KINDS[number];
@@ -85,7 +86,8 @@ const CredentialInputSchema = z.object({
     "How to read this credential's expiry. `jwt` decodes the exp claim; " +
       "`github-pat` reads GitHub's token-expiration response header; " +
       "`gitlab-pat` reads expires_at from GitLab's token self-introspection endpoint; " +
-      "`pve-token` reads the Proxmox VE user record, which embeds each token's expire.",
+      "`pve-token` reads the Proxmox VE user record, which embeds each token's expire; " +
+      "`b2-key` reads Backblaze B2's key listing, which embeds each key's expirationTimestamp.",
   ),
   secret: z.string().min(1).meta({ sensitive: true }).describe(
     "The credential itself. Supply via vault.get() — never inline. This is the same value the consuming job uses, deliberately: see module docs.",
@@ -125,6 +127,12 @@ const GlobalArgsSchema = z.object({
       "Point it at a reverse proxy holding a publicly-trusted certificate: a PVE node's own " +
       "cluster CA omits the keyUsage extension, which OpenSSL 3 and rustls both reject, so " +
       "hitting port 8006 directly cannot be made to validate.",
+  ),
+  b2BaseUrl: z.string().url().default("https://api.backblazeb2.com").describe(
+    "Backblaze B2 authorization endpoint, for `b2-key` probes, without the /b2api suffix. " +
+      "Unlike pveBaseUrl this has a real default: B2's authorization host is universal, and " +
+      "the per-account storage API URL is discovered from the authorize response rather than " +
+      "configured.",
   ),
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Abort any single probe request after this long.",
@@ -744,6 +752,245 @@ async function probePveToken(
 }
 
 /**
+ * Parse a `<applicationKeyId>:<applicationKey>` secret.
+ *
+ * That is the same pairing B2 itself takes as HTTP Basic credentials, so the
+ * stored value is exactly what the consumer presents -- no re-encoding, and no
+ * second field that could drift out of step with the first.
+ */
+export function parseB2Secret(
+  secret: string,
+): { keyId: string; appKey: string } | null {
+  const colon = secret.indexOf(":");
+  if (colon <= 0 || colon === secret.length - 1) return null;
+  const keyId = secret.slice(0, colon);
+  const appKey = secret.slice(colon + 1);
+  // A second colon means the value is not a key pair -- most likely a URL or a
+  // config line pasted whole. Refuse rather than probe a truncated id.
+  if (appKey.includes(":")) return null;
+  return { keyId, appKey };
+}
+
+/**
+ * Validate a `b2-key` subject: an applicationKeyId, never a key pair.
+ *
+ * Same discipline as {@link parsePveSubject} -- a subject carrying a `:` is a
+ * SECRET pasted where an identifier belongs, and identifiers are written into
+ * resource attributes in clear.
+ */
+export function parseB2Subject(subject: string): string | null {
+  if (subject.length === 0 || subject.includes(":")) return null;
+  return subject;
+}
+
+/**
+ * Backblaze keeps a key's expiry server-side, like Proxmox and unlike a JWT, so
+ * this reads it back from the API rather than decoding the value.
+ *
+ * `expirationTimestamp` is in MILLISECONDS, where Proxmox's `expire` is in
+ * seconds. Feeding it to {@link fromEpoch} unconverted would report a date in
+ * the year 58000 and classify a lapsed key as healthy -- so the conversion is
+ * the one thing in this probe worth checking twice.
+ *
+ * A key can report on itself, but only if it holds `listKeys`. The capability
+ * is read from the authorize response rather than inferred from a 401, because
+ * B2 answers 401 both for a refused key and for a good key lacking capability,
+ * and those are opposite conclusions: an outage versus a monitoring gap.
+ */
+async function probeB2Key(
+  secret: string,
+  globalArgs: GlobalArgs,
+  now: Date,
+  subject?: string,
+): Promise<ProbeResult> {
+  const parsed = parseB2Secret(secret);
+  if (parsed === null) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        "secret is not in Backblaze `<applicationKeyId>:<applicationKey>` form",
+    };
+  }
+
+  // What we REPORT ON is the subject when given, otherwise the key itself.
+  let target = parsed.keyId;
+  if (subject !== undefined && subject.length > 0) {
+    const parsedSubject = parseB2Subject(subject);
+    if (parsedSubject === null) {
+      return {
+        status: "authFailed",
+        expiresAt: null,
+        daysRemaining: null,
+        detail: "`subject` is not a bare Backblaze applicationKeyId",
+      };
+    }
+    target = parsedSubject;
+  }
+  const onBehalfOf = (r: ProbeResult): ProbeResult =>
+    target !== parsed.keyId
+      ? {
+        ...r,
+        detail:
+          `${r.detail} (read by the probe credential on behalf of ${target})`,
+      }
+      : r;
+
+  const authBase = globalArgs.b2BaseUrl.replace(/\/+$/, "");
+  const basic = btoa(`${parsed.keyId}:${parsed.appKey}`);
+  let authRes: Response;
+  try {
+    authRes = await fetch(`${authBase}/b2api/v3/b2_authorize_account`, {
+      headers: { "Authorization": `Basic ${basic}` },
+      signal: AbortSignal.timeout(globalArgs.timeoutMs),
+    });
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `authorize request failed: ${String(cause)}`,
+    };
+  }
+  if (authRes.status === 401) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "Backblaze refused the key (HTTP 401)",
+    };
+  }
+  if (!authRes.ok) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `unexpected HTTP ${authRes.status} from b2_authorize_account`,
+    };
+  }
+
+  let auth: {
+    accountId?: unknown;
+    authorizationToken?: unknown;
+    apiInfo?: { storageApi?: { apiUrl?: unknown; capabilities?: unknown } };
+  };
+  try {
+    auth = await authRes.json();
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `authorize response was not JSON: ${String(cause)}`,
+    };
+  }
+
+  const apiUrl = auth.apiInfo?.storageApi?.apiUrl;
+  const token = auth.authorizationToken;
+  const accountId = auth.accountId;
+  if (
+    typeof apiUrl !== "string" || typeof token !== "string" ||
+    typeof accountId !== "string"
+  ) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        "authorize response missing apiUrl, authorizationToken or accountId",
+    };
+  }
+
+  // Read the capability rather than inferring it from a 401 -- see the doc
+  // comment. A key that authenticates but cannot list keys is a monitoring gap,
+  // not an outage, and must not page anyone.
+  const caps = auth.apiInfo?.storageApi?.capabilities;
+  if (!Array.isArray(caps) || !caps.includes("listKeys")) {
+    return onBehalfOf({
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        "key authenticates but lacks the listKeys capability, so its expiry cannot be read",
+    });
+  }
+
+  // startApplicationKeyId begins the listing AT the target, so maxKeyCount=1
+  // returns exactly the row of interest -- or the next key after it if the
+  // target is gone, which is why the id is re-checked below.
+  const listUrl = `${apiUrl.replace(/\/+$/, "")}/b2api/v3/b2_list_keys` +
+    `?accountId=${encodeURIComponent(accountId)}&maxKeyCount=1` +
+    `&startApplicationKeyId=${encodeURIComponent(target)}`;
+  let listRes: Response;
+  try {
+    listRes = await fetch(listUrl, {
+      headers: { "Authorization": token },
+      signal: AbortSignal.timeout(globalArgs.timeoutMs),
+    });
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `b2_list_keys request failed: ${String(cause)}`,
+    };
+  }
+  if (!listRes.ok) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `unexpected HTTP ${listRes.status} from b2_list_keys`,
+    };
+  }
+
+  let body: { keys?: unknown };
+  try {
+    body = await listRes.json();
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `b2_list_keys response was not JSON: ${String(cause)}`,
+    };
+  }
+
+  const keys = body.keys;
+  const row = Array.isArray(keys)
+    ? (keys as Array<
+      { applicationKeyId?: unknown; expirationTimestamp?: unknown }
+    >)
+      .find((k) => k.applicationKeyId === target)
+    : undefined;
+  if (row === undefined) {
+    // Present in the manifest, absent from the account. An EXPIRED B2 key is
+    // deleted outright rather than retained as expired, so this is the shape a
+    // lapse actually takes here -- it must never read as "no expiry".
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        `no key '${target}' on this account -- deleted, expired, or the manifest is stale`,
+    };
+  }
+
+  const exp = row.expirationTimestamp;
+  if (typeof exp !== "number" || exp === 0) {
+    return onBehalfOf({
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "key is configured to never expire",
+    });
+  }
+  // MILLISECONDS -> seconds. See the doc comment.
+  return onBehalfOf(fromEpoch(exp / 1000, now, globalArgs));
+}
+
+/**
  * Resolve a probe kind to its implementation.
  *
  * The `never` assignment is the point of this function: adding an entry to
@@ -766,6 +1013,9 @@ export function probeFor(kind: ProbeKind): Probe {
     case "pve-token":
       return (secret, globalArgs, now, subject) =>
         probePveToken(secret, globalArgs, now, subject);
+    case "b2-key":
+      return (secret, globalArgs, now, subject) =>
+        probeB2Key(secret, globalArgs, now, subject);
     default: {
       const unreachable: never = kind;
       throw new Error(`no probe implemented for kind: ${String(unreachable)}`);

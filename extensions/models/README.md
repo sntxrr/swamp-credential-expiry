@@ -19,9 +19,18 @@ create, rotate or revoke anything.
 | `github-pat` | `GET {apiBaseUrl}/user` and reads the `github-authentication-token-expiration` **response header**. |
 | `gitlab-pat` | `GET {gitlabBaseUrl}/api/v4/personal_access_tokens/self` and reads `expires_at` from the body. |
 | `pve-token` | `GET {pveBaseUrl}/api2/json/access/users/{userid}` and reads `tokens[tokenid].expire` from the body. |
+| `b2-key` | `b2_authorize_account`, then `b2_list_keys`, and reads `expirationTimestamp` from the matching key. |
 
 The GitHub expiry is a header, not a body field, which is why that probe looks like a
 liveness check rather than an API call for data. A token with no expiry simply omits it.
+
+The Backblaze probe reads `expirationTimestamp`, which is in **milliseconds** — every other
+epoch this model handles is in seconds. It also reads the `listKeys` capability out of the
+authorize response rather than inferring it from a 401, because B2 answers 401 both for a key
+it refuses and for a valid key that merely lacks the capability, and those mean opposite
+things: an outage versus a monitoring gap. Note that B2 **deletes** an expired key rather than
+retaining it as expired, so a lapse shows up as the key being absent — reported as
+`authFailed`, never as `noExpiry`.
 
 The GitLab probe works for **project and group access tokens too** — GitLab implements
 both as personal tokens belonging to a bot user, so they answer the same endpoint.
@@ -143,6 +152,11 @@ globalArguments:
       secret: '${{ vault.get(store, pve/expiry-monitor) }}'
       subject: builder@pve!provisioner
       note: the only credential the VM provisioner authenticates with
+    - id: b2-key/backup-provisioner
+      kind: b2-key
+      # `<applicationKeyId>:<applicationKey>` -- the same pair B2 takes as Basic auth
+      secret: "${{ vault.get(store, b2/provisioner) }}"
+      note: mints the per-host backup keys; its lapse stops provisioning
   pveBaseUrl: https://pve.example.com
   warnDays: [30, 14, 7]
   criticalDays: 3
