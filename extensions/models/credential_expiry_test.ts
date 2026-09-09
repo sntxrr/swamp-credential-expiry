@@ -791,3 +791,73 @@ Deno.test("a trailing slash on b2BaseUrl does not double the separator", async (
     "https://api.backblazeb2.com/b2api/v3/b2_authorize_account",
   );
 });
+
+Deno.test("b2-key treats a non-401 authorize failure as unreachable, not as a credential fault", async () => {
+  // A 500 from Backblaze is their outage, not our credential's. Reporting it as
+  // authFailed would page someone to rotate a key that is perfectly good.
+  const res = await withFetch(
+    b2Fetch([], { authStatus: 503 }),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "unreachable");
+});
+
+Deno.test("b2-key treats a non-JSON authorize body as unreachable", async () => {
+  // A captive portal or proxy returning HTML with a 200. Parsing must not throw
+  // out of the probe and take the whole audit down with it.
+  const res = await withFetch(
+    () => new Response("<html>proxy</html>", { status: 200 }),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "unreachable");
+});
+
+Deno.test("b2-key treats an authorize response missing apiUrl as unreachable", async () => {
+  // Well-formed JSON that is not the contract. Proceeding would build a request
+  // against `undefined` and fail somewhere less legible.
+  const res = await withFetch(
+    () =>
+      new Response(
+        JSON.stringify({ accountId: "abc012345678", authorizationToken: "t" }),
+        { status: 200 },
+      ),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "unreachable");
+});
+
+Deno.test("b2-key separates a network failure from a credential failure", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (() => Promise.reject(new Error("boom"))) as typeof fetch;
+  try {
+    const res = await probeFor("b2-key")(B2_SECRET, B2, NOW);
+    assertEquals(res.status, "unreachable");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("b2-key treats a failed b2_list_keys as unreachable, never as noExpiry", async () => {
+  // The dangerous alternative: a key whose expiry could not be READ must not be
+  // reported as a key that HAS no expiry. Those look identical in a summary and
+  // mean opposite things.
+  const res = await withFetch(
+    (url) =>
+      url.includes("b2_list_keys")
+        ? new Response("", { status: 500 })
+        : b2Fetch([])(url),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "unreachable");
+});
+
+Deno.test("b2-key treats a non-JSON b2_list_keys body as unreachable", async () => {
+  const res = await withFetch(
+    (url) =>
+      url.includes("b2_list_keys")
+        ? new Response("not json", { status: 200 })
+        : b2Fetch([])(url),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(res.status, "unreachable");
+});
