@@ -20,6 +20,7 @@ create, rotate or revoke anything.
 | `gitlab-pat` | `GET {gitlabBaseUrl}/api/v4/personal_access_tokens/self` and reads `expires_at` from the body. |
 | `pve-token` | `GET {pveBaseUrl}/api2/json/access/users/{userid}` and reads `tokens[tokenid].expire` from the body. |
 | `b2-key` | `b2_authorize_account`, then `b2_list_keys`, and reads `expirationTimestamp` from the matching key. |
+| `scaleway-key` | `GET {scwBaseUrl}/iam/v1alpha1/api-keys/{subject}` and reads `expires_at` from the body. `subject` is required. |
 
 The GitHub expiry is a header, not a body field, which is why that probe looks like a
 liveness check rather than an API call for data. A token with no expiry simply omits it.
@@ -31,6 +32,16 @@ it refuses and for a valid key that merely lacks the capability, and those mean 
 things: an outage versus a monitoring gap. Note that B2 **deletes** an expired key rather than
 retaining it as expired, so a lapse shows up as the key being absent — reported as
 `authFailed`, never as `noExpiry`.
+
+The Scaleway probe **requires `subject`**. A Scaleway secret key authenticates on its own and
+nothing says which access key it belongs to, so even a key reporting on itself names its own
+access key id. The probe secret needs IAM read at organization scope — `IAMUserReadOnly` plus
+`IAMApplicationReadOnly` covers keys attached to both users and applications — so one read-only
+key watches every key in the organization, including the scoped ones that cannot read IAM at
+all. The status codes carry the distinctions: `401` is a refused probe secret (`authFailed`),
+`403` is a probe that authenticates but cannot read IAM (`noExpiry` — a monitoring gap, not an
+outage), and `404` is a watched key absent from the organization (`authFailed`, never
+`noExpiry`).
 
 The GitLab probe works for **project and group access tokens too** — GitLab implements
 both as personal tokens belonging to a bot user, so they answer the same endpoint.
@@ -157,6 +168,12 @@ globalArguments:
       # `<applicationKeyId>:<applicationKey>` -- the same pair B2 takes as Basic auth
       secret: "${{ vault.get(store, b2/provisioner) }}"
       note: mints the per-host backup keys; its lapse stops provisioning
+    - id: scaleway-key/mail-relay
+      kind: scaleway-key
+      # a read-only probe key (IAM read, organization scope) reads on the relay key's behalf
+      secret: "${{ vault.get(store, scaleway/expiry-probe) }}"
+      subject: SCWEXAMPLEKEY0000001
+      note: the transactional-email relay key every host sends through
   pveBaseUrl: https://pve.example.com
   warnDays: [30, 14, 7]
   criticalDays: 3

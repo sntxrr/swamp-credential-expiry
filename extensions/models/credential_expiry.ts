@@ -57,6 +57,7 @@ export const PROBE_KINDS = [
   "gitlab-pat",
   "pve-token",
   "b2-key",
+  "scaleway-key",
 ] as const;
 /** One of the supported probe kinds, narrowed from {@link PROBE_KINDS}. */
 export type ProbeKind = typeof PROBE_KINDS[number];
@@ -87,7 +88,8 @@ const CredentialInputSchema = z.object({
       "`github-pat` reads GitHub's token-expiration response header; " +
       "`gitlab-pat` reads expires_at from GitLab's token self-introspection endpoint; " +
       "`pve-token` reads the Proxmox VE user record, which embeds each token's expire; " +
-      "`b2-key` reads Backblaze B2's key listing, which embeds each key's expirationTimestamp.",
+      "`b2-key` reads Backblaze B2's key listing, which embeds each key's expirationTimestamp; " +
+      "`scaleway-key` reads a Scaleway IAM API key record, which carries expires_at.",
   ),
   secret: z.string().min(1).meta({ sensitive: true }).describe(
     "The credential itself. Supply via vault.get() — never inline. This is the same value the consuming job uses, deliberately: see module docs.",
@@ -96,11 +98,14 @@ const CredentialInputSchema = z.object({
     "Free text carried onto the resource, e.g. which job would break. Shown in alerts.",
   ),
   subject: z.string().default("").describe(
-    "`pve-token` only: the token to REPORT ON, as `user@realm!tokenid`, when it is not the " +
-      "one authenticating. Leave unset to have the credential report on itself. This exists " +
-      "because a least-privilege Proxmox token has no Sys.Audit and so cannot read its own " +
-      "expiry -- granting it that to make it self-monitoring would widen the blast radius " +
-      "the scoping was for. A separate read-only credential reads on its behalf instead.",
+    "The credential to REPORT ON when it is not the one authenticating: for `pve-token` a " +
+      "`user@realm!tokenid`, for `b2-key` an applicationKeyId, for `scaleway-key` an access " +
+      "key id (`SCW` + 17 characters). Leave unset to have a `pve-token` or `b2-key` report " +
+      "on itself; `scaleway-key` REQUIRES it, because a Scaleway secret key does not reveal " +
+      "which access key it belongs to. This exists because a least-privilege credential " +
+      "often cannot read its own expiry -- granting it that to make it self-monitoring would " +
+      "widen the blast radius the scoping was for. A separate read-only credential reads on " +
+      "its behalf instead. Never a secret: subjects are written into resources in clear.",
   ),
 });
 
@@ -133,6 +138,10 @@ const GlobalArgsSchema = z.object({
       "Unlike pveBaseUrl this has a real default: B2's authorization host is universal, and " +
       "the per-account storage API URL is discovered from the authorize response rather than " +
       "configured.",
+  ),
+  scwBaseUrl: z.string().url().default("https://api.scaleway.com").describe(
+    "Scaleway API base URL, for `scaleway-key` probes, without the /iam suffix. IAM is a " +
+      "global (region-less) API, so the public default is right for every organization.",
   ),
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Abort any single probe request after this long.",
@@ -990,6 +999,161 @@ async function probeB2Key(
   return onBehalfOf(fromEpoch(exp / 1000, now, globalArgs));
 }
 
+/** A Scaleway secret key: a bare UUID, which is all `X-Auth-Token` takes. */
+const SCW_SECRET_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A Scaleway access key id: `SCW` followed by 17 upper-case alphanumerics. */
+const SCW_ACCESS_KEY_RE = /^SCW[A-Z0-9]{17}$/;
+
+/**
+ * Validate a `scaleway-key` subject: an access key id, never a secret.
+ *
+ * Same discipline as {@link parsePveSubject} and {@link parseB2Subject}, but
+ * stricter, because the id has one fixed shape: anything else -- a secret-key
+ * UUID above all -- is refused before it can be written into a resource.
+ */
+export function parseScalewaySubject(subject: string): string | null {
+  return SCW_ACCESS_KEY_RE.test(subject) ? subject : null;
+}
+
+/**
+ * Scaleway keeps a key's expiry server-side, so this reads the key's IAM record
+ * rather than decoding anything.
+ *
+ * Unlike every other kind here, `subject` is REQUIRED: a Scaleway secret key
+ * authenticates on its own (`X-Auth-Token`) and nothing in it, or in any
+ * self-describing endpoint, says which access key it belongs to. A probe key
+ * reporting on itself therefore names its own access key id as the subject.
+ *
+ * Status codes carry the distinctions B2 needed a capability list for:
+ * 401 is a refused secret (an outage); 403 is a secret that authenticates but
+ * lacks IAM read (a monitoring gap, which must not page anyone); 404 is a key
+ * absent from the organization -- deleted, or never there -- which must read
+ * as an outage, never as "no expiry".
+ */
+async function probeScalewayKey(
+  secret: string,
+  globalArgs: GlobalArgs,
+  now: Date,
+  subject?: string,
+): Promise<ProbeResult> {
+  if (!SCW_SECRET_RE.test(secret)) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "secret is not a Scaleway secret key (a UUID)",
+    };
+  }
+  const target = parseScalewaySubject(subject ?? "");
+  if (target === null) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: (subject ?? "").length === 0
+        ? "`subject` is required for scaleway-key: a secret key does not identify its own access key"
+        : "`subject` is not a Scaleway access key id (`SCW` + 17 characters)",
+    };
+  }
+
+  const url = `${globalArgs.scwBaseUrl.replace(/\/+$/, "")}` +
+    `/iam/v1alpha1/api-keys/${encodeURIComponent(target)}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: { "X-Auth-Token": secret },
+      signal: AbortSignal.timeout(globalArgs.timeoutMs),
+    });
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `request failed: ${String(cause)}`,
+    };
+  }
+  if (res.status === 401) {
+    await res.body?.cancel();
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "Scaleway refused the probe secret (HTTP 401)",
+    };
+  }
+  if (res.status === 403) {
+    // Authenticated, but without IAM read -- see the doc comment.
+    await res.body?.cancel();
+    return {
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        `probe secret authenticates but cannot read IAM, so the expiry of ${target} cannot be read (HTTP 403)`,
+    };
+  }
+  if (res.status === 404) {
+    await res.body?.cancel();
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        `no key '${target}' in this organization -- deleted, or the manifest is stale`,
+    };
+  }
+  if (!res.ok) {
+    await res.body?.cancel();
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `unexpected HTTP ${res.status} from the IAM api-keys endpoint`,
+    };
+  }
+
+  let body: { access_key?: unknown; expires_at?: unknown };
+  try {
+    body = await res.json();
+  } catch (cause) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `api-keys response was not JSON: ${String(cause)}`,
+    };
+  }
+  if (body.access_key !== target) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: `api-keys response was for a different key than ${target}`,
+    };
+  }
+
+  const exp = body.expires_at;
+  if (exp === null || exp === undefined || exp === "") {
+    return {
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "key is configured to never expire",
+    };
+  }
+  const ms = typeof exp === "string" ? Date.parse(exp) : NaN;
+  if (Number.isNaN(ms)) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "expires_at is not an ISO 8601 timestamp",
+    };
+  }
+  return fromEpoch(ms / 1000, now, globalArgs);
+}
+
 /**
  * Resolve a probe kind to its implementation.
  *
@@ -1016,6 +1180,9 @@ export function probeFor(kind: ProbeKind): Probe {
     case "b2-key":
       return (secret, globalArgs, now, subject) =>
         probeB2Key(secret, globalArgs, now, subject);
+    case "scaleway-key":
+      return (secret, globalArgs, now, subject) =>
+        probeScalewayKey(secret, globalArgs, now, subject);
     default: {
       const unreachable: never = kind;
       throw new Error(`no probe implemented for kind: ${String(unreachable)}`);
@@ -1032,7 +1199,7 @@ export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.09.08.2",
+  version: "2026.09.30.1",
   // Purely additive: a fourth probe kind and the `pveBaseUrl` global argument
   // that serves it. No stored attribute changes shape, so the migration is a
   // no-op -- but it has to be DECLARED, or existing instances pin themselves to
@@ -1053,6 +1220,12 @@ export const model = {
       toVersion: "2026.09.08.2",
       description:
         "Adds the optional `subject` field, so a `pve-token` entry can report on a token OTHER than the one it authenticates with. Nothing to migrate -- `subject` defaults to empty, and an empty subject keeps the previous behaviour of deriving the reported token from the secret. Set it when a least-privilege token cannot read its own expiry: the entry's `secret` becomes a read-only credential holding Sys.Audit, and `subject` names the token being watched.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.30.1",
+      description:
+        "Adds the `scaleway-key` probe kind and the `scwBaseUrl` global argument, and declares the `b2-key` kind shipped in 2026.09.09.1 without a model version bump. Nothing to migrate: the credential and audit resource schemas are unchanged. To monitor a Scaleway API key, add an entry with `kind: scaleway-key` whose secret is a read-only probe key's secret (IAM read at organization scope) and whose `subject` is the access key id being watched -- required, because a Scaleway secret does not identify its own access key.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
