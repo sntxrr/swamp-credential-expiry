@@ -7,6 +7,7 @@ import {
   parseB2Subject,
   parseGithubExpiryHeader,
   parseGitlabExpiryDate,
+  parseScalewaySubject,
   PROBE_KINDS,
   probeFor,
 } from "./credential_expiry.ts";
@@ -631,6 +632,7 @@ const B2 = {
   gitlabBaseUrl: "https://gitlab.example.com",
   pveBaseUrl: "https://pve.example.com",
   b2BaseUrl: "https://api.backblazeb2.com",
+  scwBaseUrl: "https://api.scaleway.com",
   timeoutMs: 15000,
 };
 const B2_SECRET = "002abc0123456780000000099:K002aaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -860,4 +862,228 @@ Deno.test("b2-key treats a non-JSON b2_list_keys body as unreachable", async () 
     () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
   );
   assertEquals(res.status, "unreachable");
+});
+
+// ---------------------------------------------------------------------------
+// scaleway-key
+// ---------------------------------------------------------------------------
+
+const SCW = B2;
+const SCW_SECRET = "00000000-1111-2222-3333-444444444444";
+const SCW_SUBJECT = "SCWEXAMPLEKEY0000001";
+
+/** Answer the single IAM api-keys GET with a status and optional body. */
+function scwFetch(status: number, body?: Record<string, unknown>) {
+  return (): Response =>
+    new Response(body === undefined ? "" : JSON.stringify(body), { status });
+}
+
+Deno.test("scaleway-key reads expires_at and classifies it", async () => {
+  let seenUrl = "";
+  let seenToken: string | null = null;
+  const res = await withFetch(
+    (url, init) => {
+      seenUrl = url;
+      seenToken = new Headers(init.headers).get("X-Auth-Token");
+      return scwFetch(200, {
+        access_key: SCW_SUBJECT,
+        expires_at: "2026-11-17T00:00:00Z",
+      })();
+    },
+    () =>
+      Promise.resolve(
+        probeFor("scaleway-key")(SCW_SECRET, SCW, NOW, SCW_SUBJECT),
+      ),
+  );
+  assertEquals(
+    seenUrl,
+    `https://api.scaleway.com/iam/v1alpha1/api-keys/${SCW_SUBJECT}`,
+  );
+  assertEquals(seenToken, SCW_SECRET);
+  assertEquals(res.expiresAt, "2026-11-17T00:00:00.000Z");
+  assertEquals(res.daysRemaining, 90);
+  assertEquals(res.status, "ok");
+});
+
+Deno.test("scaleway-key crosses the warn and critical thresholds", async () => {
+  const at = (iso: string) =>
+    withFetch(
+      scwFetch(200, { access_key: SCW_SUBJECT, expires_at: iso }),
+      () =>
+        Promise.resolve(
+          probeFor("scaleway-key")(SCW_SECRET, SCW, NOW, SCW_SUBJECT),
+        ),
+    );
+  assertEquals((await at("2026-09-02T00:00:00Z")).status, "warn"); // 14 days
+  assertEquals((await at("2026-08-21T00:00:00Z")).status, "critical"); // 2 days
+  assertEquals((await at("2026-08-18T00:00:00Z")).status, "expired");
+});
+
+Deno.test("scaleway-key treats a null expires_at as noExpiry", async () => {
+  // An owner-attached key minted without an expiry. It must be SEEN -- the
+  // whole point is that an eternal key shows up as a standing finding.
+  const res = await withFetch(
+    scwFetch(200, { access_key: SCW_SUBJECT, expires_at: null }),
+    () =>
+      Promise.resolve(
+        probeFor("scaleway-key")(SCW_SECRET, SCW, NOW, SCW_SUBJECT),
+      ),
+  );
+  assertEquals(res.status, "noExpiry");
+  assertEquals(res.expiresAt, null);
+});
+
+Deno.test("scaleway-key reports a refused probe secret as authFailed", async () => {
+  const res = await withFetch(
+    scwFetch(401, { message: "authentication is denied" }),
+    () =>
+      Promise.resolve(
+        probeFor("scaleway-key")(SCW_SECRET, SCW, NOW, SCW_SUBJECT),
+      ),
+  );
+  assertEquals(res.status, "authFailed");
+});
+
+Deno.test("scaleway-key treats a 403 as a monitoring gap, not an outage", async () => {
+  // A scoped key (e.g. send-only mail) authenticates fine but cannot read IAM.
+  // That is a misconfigured PROBE, not a dying credential, and must not page
+  // anyone to rotate a key that works.
+  const res = await withFetch(
+    scwFetch(403, { message: "insufficient permissions" }),
+    () =>
+      Promise.resolve(
+        probeFor("scaleway-key")(SCW_SECRET, SCW, NOW, SCW_SUBJECT),
+      ),
+  );
+  assertEquals(res.status, "noExpiry");
+  assertEquals(res.detail.includes("403"), true);
+});
+
+Deno.test("scaleway-key reports a key missing from the organization as an outage, never as noExpiry", async () => {
+  // A watched key that was deleted, or a manifest pointing at a key that never
+  // existed. Either way whatever holds it is broken or the inventory is wrong.
+  const res = await withFetch(
+    scwFetch(404, { message: "resource is not found" }),
+    () =>
+      Promise.resolve(
+        probeFor("scaleway-key")(SCW_SECRET, SCW, NOW, SCW_SUBJECT),
+      ),
+  );
+  assertEquals(res.status, "authFailed");
+  assertEquals(res.detail.includes(SCW_SUBJECT), true);
+});
+
+Deno.test("scaleway-key treats a 5xx as unreachable, not as a credential fault", async () => {
+  const res = await withFetch(
+    scwFetch(503),
+    () =>
+      Promise.resolve(
+        probeFor("scaleway-key")(SCW_SECRET, SCW, NOW, SCW_SUBJECT),
+      ),
+  );
+  assertEquals(res.status, "unreachable");
+});
+
+Deno.test("scaleway-key treats a non-JSON or wrong-key body as unreachable", async () => {
+  const run = (h: () => Response) =>
+    withFetch(
+      h,
+      () =>
+        Promise.resolve(
+          probeFor("scaleway-key")(SCW_SECRET, SCW, NOW, SCW_SUBJECT),
+        ),
+    );
+  assertEquals(
+    (await run(() => new Response("<html>proxy</html>", { status: 200 })))
+      .status,
+    "unreachable",
+  );
+  assertEquals(
+    (await run(
+      scwFetch(200, {
+        access_key: "SCWSOMEOTHERKEY00001",
+        expires_at: "2026-11-17T00:00:00Z",
+      }),
+    )).status,
+    "unreachable",
+  );
+  assertEquals(
+    (await run(scwFetch(200, { access_key: SCW_SUBJECT, expires_at: "soon" })))
+      .status,
+    "unreachable",
+  );
+});
+
+Deno.test("scaleway-key separates a network failure from a credential failure", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (() => Promise.reject(new Error("boom"))) as typeof fetch;
+  try {
+    const res = await probeFor("scaleway-key")(
+      SCW_SECRET,
+      SCW,
+      NOW,
+      SCW_SUBJECT,
+    );
+    assertEquals(res.status, "unreachable");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("scaleway-key refuses a missing subject, a bad subject or a bad secret before any request", async () => {
+  // A Scaleway secret does not name its own access key, so there is nothing to
+  // fall back to. And a subject is written into resources in clear, so a secret
+  // pasted there must be refused, not probed.
+  let called = 0;
+  const run = (secret: string, subject?: string) =>
+    withFetch(
+      () => {
+        called++;
+        return scwFetch(500)();
+      },
+      () =>
+        Promise.resolve(
+          probeFor("scaleway-key")(secret, SCW, NOW, subject),
+        ),
+    );
+  const noSubject = await run(SCW_SECRET);
+  assertEquals(noSubject.status, "authFailed");
+  assertEquals(noSubject.detail.includes("required"), true);
+  assertEquals((await run(SCW_SECRET, SCW_SECRET)).status, "authFailed");
+  assertEquals(
+    (await run("SCWEXAMPLEKEY0000001", SCW_SUBJECT)).status,
+    "authFailed",
+  );
+  assertEquals(called, 0);
+});
+
+Deno.test("parseScalewaySubject accepts only an access key id", () => {
+  assertEquals(parseScalewaySubject(SCW_SUBJECT), SCW_SUBJECT);
+  assertEquals(parseScalewaySubject(""), null);
+  assertEquals(parseScalewaySubject(SCW_SECRET), null);
+  assertEquals(parseScalewaySubject("scwexamplekey0000001"), null);
+  assertEquals(parseScalewaySubject("SCWEXAMPLEKEY00000012"), null);
+});
+
+Deno.test("scaleway-key tolerates a trailing slash on scwBaseUrl", async () => {
+  let seen = "";
+  await withFetch(
+    (url) => {
+      seen = url;
+      return scwFetch(200, { access_key: SCW_SUBJECT, expires_at: null })();
+    },
+    () =>
+      Promise.resolve(
+        probeFor("scaleway-key")(
+          SCW_SECRET,
+          { ...SCW, scwBaseUrl: "https://api.scaleway.com/" },
+          NOW,
+          SCW_SUBJECT,
+        ),
+      ),
+  );
+  assertEquals(
+    seen,
+    `https://api.scaleway.com/iam/v1alpha1/api-keys/${SCW_SUBJECT}`,
+  );
 });
