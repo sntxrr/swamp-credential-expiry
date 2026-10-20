@@ -47,7 +47,9 @@
  *    failure is reported as that entry's `unresolved` status -- the others are
  *    still probed.
  *
- * 5. **Read-only, by construction.** Every probe here is a decode or a GET.
+ * 5. **Read-only, by construction.** Every probe here is a decode, a GET, or
+ *    (for `swamp-serve-token`) a `swamp access token list`, which reads token
+ *    metadata and never a token's secret.
  *    There is no method that can create, rotate or revoke anything, which is
  *    what makes it safe to run unattended on a schedule against production
  *    credentials. Rotation deliberately lives elsewhere — see
@@ -66,9 +68,19 @@ export const PROBE_KINDS = [
   "pve-token",
   "b2-key",
   "scaleway-key",
+  "swamp-serve-token",
 ] as const;
 /** One of the supported probe kinds, narrowed from {@link PROBE_KINDS}. */
 export type ProbeKind = typeof PROBE_KINDS[number];
+
+/**
+ * Kinds whose expiry is read from a record the model can already see, so the
+ * entry holds no secret at all. Giving one a `secret` would only put a value
+ * somewhere it is never used.
+ */
+export const SECRETLESS_KINDS: ReadonlySet<ProbeKind> = new Set([
+  "swamp-serve-token",
+]);
 
 /**
  * Outcomes, ordered worst-first. `authFailed` outranks `expired` because a
@@ -109,7 +121,9 @@ const CredentialInputSchema = z.object({
       "`gitlab-pat` reads expires_at from GitLab's token self-introspection endpoint; " +
       "`pve-token` reads the Proxmox VE user record, which embeds each token's expire; " +
       "`b2-key` reads Backblaze B2's key listing, which embeds each key's expirationTimestamp; " +
-      "`scaleway-key` reads a Scaleway IAM API key record, which carries expires_at.",
+      "`scaleway-key` reads a Scaleway IAM API key record, which carries expires_at; " +
+      "`swamp-serve-token` reads expiresAt for the server token named by `subject` from " +
+      "`swamp access token list`, and takes no secret.",
   ),
   // `sensitive` is set on BOTH sides of `.optional()`: each wrapper is its own
   // schema with its own metadata, so a flag set only inside is invisible to
@@ -129,15 +143,31 @@ const CredentialInputSchema = z.object({
   subject: z.string().default("").describe(
     "The credential to REPORT ON when it is not the one authenticating: for `pve-token` a " +
       "`user@realm!tokenid`, for `b2-key` an applicationKeyId, for `scaleway-key` an access " +
-      "key id (`SCW` + 17 characters). Leave unset to have a `pve-token` or `b2-key` report " +
-      "on itself; `scaleway-key` REQUIRES it, because a Scaleway secret key does not reveal " +
+      "key id (`SCW` + 17 characters), for `swamp-serve-token` the server token's name. " +
+      "Leave unset to have a `pve-token` or `b2-key` report " +
+      "on itself; `scaleway-key` and `swamp-serve-token` REQUIRE it, because a Scaleway secret key does not reveal " +
       "which access key it belongs to. This exists because a least-privilege credential " +
       "often cannot read its own expiry -- granting it that to make it self-monitoring would " +
       "widen the blast radius the scoping was for. A separate read-only credential reads on " +
       "its behalf instead. Never a secret: subjects are written into resources in clear.",
   ),
-}).refine((c) => (c.secret === undefined) !== (c.secretRef === undefined), {
-  message: "set exactly one of `secret` and `secretRef`",
+}).superRefine((c, ctx) => {
+  if (SECRETLESS_KINDS.has(c.kind)) {
+    if (c.secret !== undefined || c.secretRef !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          `\`${c.kind}\` takes no secret: set neither \`secret\` nor \`secretRef\``,
+      });
+    }
+    return;
+  }
+  if ((c.secret === undefined) === (c.secretRef === undefined)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "set exactly one of `secret` and `secretRef`",
+    });
+  }
 });
 
 const GlobalArgsSchema = z.object({
@@ -173,6 +203,14 @@ const GlobalArgsSchema = z.object({
   scwBaseUrl: z.string().url().default("https://api.scaleway.com").describe(
     "Scaleway API base URL, for `scaleway-key` probes, without the /iam suffix. IAM is a " +
       "global (region-less) API, so the public default is right for every organization.",
+  ),
+  swampBin: z.string().min(1).default("swamp").describe(
+    "The swamp CLI, for `swamp-serve-token` probes. Run as `swamp access token list --json`.",
+  ),
+  swampRepoDir: z.string().default("").describe(
+    "Repository whose server tokens a `swamp-serve-token` probe reads, passed as --repo-dir. " +
+      "Empty uses the method's working directory. Set it to the served repository, so a " +
+      "run anywhere else fails as `unreachable` instead of reading some other repo's tokens.",
   ),
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Abort any single probe request after this long.",
@@ -666,12 +704,22 @@ async function probeGitlabPat(
   return fromEpoch(exp, now, globalArgs);
 }
 
+/**
+ * What a probe may share across entries within one audit. Only the serve token
+ * listing today: one `swamp access token list` answers every entry, so the
+ * audit reads it once rather than starting the CLI per token.
+ */
+export type ProbeDeps = {
+  serveTokens?: () => Promise<ServeTokenListing>;
+};
+
 /** A probe, normalised to one signature so the dispatch can be exhaustive. */
 type Probe = (
   secret: string,
   globalArgs: GlobalArgs,
   now: Date,
   subject?: string,
+  deps?: ProbeDeps,
 ) => ProbeResult | Promise<ProbeResult>;
 
 /**
@@ -1264,6 +1312,212 @@ async function probeScalewayKey(
 }
 
 /**
+ * One server token as `swamp access token list --json` describes it. Only these
+ * fields are kept; the listing carries no secret, and anything else it grows is
+ * dropped here rather than carried into a resource.
+ */
+export type ServeTokenRow = {
+  name: string;
+  state: string;
+  effectiveState: string;
+  expiresAt: string | null;
+};
+
+/** The serve token listing, or why it could not be read. */
+export type ServeTokenListing = { tokens: ServeTokenRow[] } | {
+  detail: string;
+};
+
+/** Longest CLI error carried into a resource and an alert body. */
+const MAX_CLI_DETAIL = 300;
+
+function capDetail(detail: string): string {
+  const flat = detail.replace(/\s+/g, " ").trim();
+  return flat.length > MAX_CLI_DETAIL
+    ? `${flat.slice(0, MAX_CLI_DETAIL - 1)}…`
+    : flat;
+}
+
+/**
+ * Parse `swamp access token list --json` output.
+ *
+ * A body that is not an array of named rows is reported, never read as "no
+ * tokens": an empty listing would turn every entry into a missing-token
+ * outage, and a garbled one must not do that either. The raw output is never
+ * echoed into the detail.
+ *
+ * Exported for tests.
+ */
+export function parseServeTokenList(stdout: string): ServeTokenListing {
+  let body: unknown;
+  try {
+    body = JSON.parse(stdout);
+  } catch {
+    return { detail: "`swamp access token list --json` did not print JSON" };
+  }
+  if (!Array.isArray(body)) {
+    return {
+      detail: "`swamp access token list --json` did not print an array",
+    };
+  }
+  const tokens: ServeTokenRow[] = [];
+  for (const row of body as Array<Record<string, unknown>>) {
+    if (typeof row?.name !== "string") {
+      return { detail: "a token listing row has no name" };
+    }
+    tokens.push({
+      name: row.name,
+      state: typeof row.state === "string" ? row.state : "",
+      effectiveState: typeof row.effectiveState === "string"
+        ? row.effectiveState
+        : "",
+      expiresAt: typeof row.expiresAt === "string" ? row.expiresAt : null,
+    });
+  }
+  return { tokens };
+}
+
+/** Runs a command and returns its exit code and output. Injected by tests. */
+export type CommandRunner = (
+  argv: string[],
+  timeoutMs: number,
+) => Promise<{ code: number; stdout: string; stderr: string }>;
+
+const runCommand: CommandRunner = async (argv, timeoutMs) => {
+  // The only subprocess in this model: a fixed `swamp access token list --json`,
+  // whose sole variable parts are the configured binary and repo dir. No swamp
+  // primitive exposes server token metadata to a model.
+  // swamp-quality-ignore deno-command
+  const output = await new Deno.Command(argv[0], {
+    args: argv.slice(1),
+    stdin: "null",
+    stdout: "piped",
+    stderr: "piped",
+    signal: AbortSignal.timeout(timeoutMs),
+  }).output();
+  const decoder = new TextDecoder();
+  return {
+    code: output.code,
+    stdout: decoder.decode(output.stdout),
+    stderr: decoder.decode(output.stderr),
+  };
+};
+
+/**
+ * Read the server token listing through the swamp CLI. Never throws: a CLI that
+ * is missing, times out or exits non-zero is a listing `detail`, which the probe
+ * reports as `unreachable` -- a statement about the monitor, not the token.
+ */
+export async function readServeTokenList(
+  globalArgs: Pick<GlobalArgs, "swampBin" | "swampRepoDir" | "timeoutMs">,
+  run: CommandRunner = runCommand,
+): Promise<ServeTokenListing> {
+  const argv = [globalArgs.swampBin, "access", "token", "list", "--json"];
+  if (globalArgs.swampRepoDir) argv.push("--repo-dir", globalArgs.swampRepoDir);
+  let result: Awaited<ReturnType<CommandRunner>>;
+  try {
+    result = await run(argv, globalArgs.timeoutMs);
+  } catch (cause) {
+    return { detail: capDetail(`could not run ${argv.join(" ")}: ${cause}`) };
+  }
+  if (result.code !== 0) {
+    return {
+      detail: capDetail(
+        `${argv.join(" ")} exited ${result.code}: ${result.stderr}`,
+      ),
+    };
+  }
+  return parseServeTokenList(result.stdout);
+}
+
+/**
+ * Validate a `swamp-serve-token` subject: a token NAME. A server token is
+ * presented as `<name>.<secret>`, so a subject carrying a `.` is the token
+ * itself pasted where its name belongs, and is refused before it can be written
+ * into a resource.
+ */
+export function parseServeTokenSubject(subject: string): string | null {
+  return /^[A-Za-z0-9_-]+$/.test(subject) ? subject : null;
+}
+
+/**
+ * swamp serve keeps each server token's expiry in its own token store, and the
+ * listing exposes it with no secret attached. So, unlike every other probe,
+ * this one holds no credential: the entry names a token and the probe looks it
+ * up.
+ *
+ * A token absent from the listing, or one the store marks as no longer
+ * active, is an outage -- whoever presents it is refused today -- and must
+ * never read as `noExpiry`. A token past its expiresAt is `expired` whatever
+ * its state says.
+ */
+export function probeSwampServeToken(
+  subject: string | undefined,
+  listing: ServeTokenListing,
+  now: Date,
+  policy: { warnDays: number[]; criticalDays: number },
+): ProbeResult {
+  const name = parseServeTokenSubject(subject ?? "");
+  if (name === null) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: (subject ?? "").length === 0
+        ? "`subject` is required for swamp-serve-token: it names the server token"
+        : "`subject` is not a server token name (a `<name>.<secret>` token was pasted?)",
+    };
+  }
+  if ("detail" in listing) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: listing.detail,
+    };
+  }
+  const row = listing.tokens.find((t) => t.name === name);
+  if (row === undefined) {
+    return {
+      status: "authFailed",
+      expiresAt: null,
+      daysRemaining: null,
+      detail:
+        `no server token '${name}' on this serve -- deleted, never minted, or the manifest is stale`,
+    };
+  }
+  if (row.expiresAt === null) {
+    return {
+      status: "noExpiry",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "server token reports no expiresAt -- unmonitorable by any clock",
+    };
+  }
+  const ms = Date.parse(row.expiresAt);
+  if (Number.isNaN(ms)) {
+    return {
+      status: "unreachable",
+      expiresAt: null,
+      daysRemaining: null,
+      detail: "expiresAt is not an ISO 8601 timestamp",
+    };
+  }
+  const result = fromEpoch(ms / 1000, now, policy);
+  if (result.status !== "expired" && row.effectiveState !== "active") {
+    return {
+      ...result,
+      status: "authFailed",
+      daysRemaining: null,
+      detail: `server token '${name}' is ${
+        row.effectiveState || "in an unknown state"
+      }, not active`,
+    };
+  }
+  return result;
+}
+
+/**
  * Resolve a probe kind to its implementation.
  *
  * The `never` assignment is the point of this function: adding an entry to
@@ -1292,6 +1546,16 @@ export function probeFor(kind: ProbeKind): Probe {
     case "scaleway-key":
       return (secret, globalArgs, now, subject) =>
         probeScalewayKey(secret, globalArgs, now, subject);
+    case "swamp-serve-token":
+      // No secret: the listing is the whole input. Read it through the
+      // audit's shared listing when there is one, otherwise on its own.
+      return async (_secret, globalArgs, now, subject, deps) =>
+        probeSwampServeToken(
+          subject,
+          await (deps?.serveTokens?.() ?? readServeTokenList(globalArgs)),
+          now,
+          globalArgs,
+        );
     default: {
       const unreachable: never = kind;
       throw new Error(`no probe implemented for kind: ${String(unreachable)}`);
@@ -1308,7 +1572,7 @@ export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.10.20.1",
+  version: "2026.10.20.2",
   // Purely additive: a fourth probe kind and the `pveBaseUrl` global argument
   // that serves it. No stored attribute changes shape, so the migration is a
   // no-op -- but it has to be DECLARED, or existing instances pin themselves to
@@ -1341,6 +1605,12 @@ export const model = {
       toVersion: "2026.10.20.1",
       description:
         "Adds the optional `secretRef: {vault, key}` field and the `unresolved` status. Nothing to migrate: `secret` still works exactly as before. An entry that names `secretRef` instead is read by the method itself, so a missing or unreadable vault item is reported as that entry's `unresolved` status (counted in the new `unresolved` audit field, and alerted immediately like `authFailed`) rather than failing the whole audit before any credential is probed. Set exactly one of `secret` and `secretRef` per entry.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.20.2",
+      description:
+        "Adds the `swamp-serve-token` probe kind and the `swampBin` / `swampRepoDir` global arguments. Nothing to migrate: the credential and audit resource schemas are unchanged. To monitor a swamp serve server token, add an entry with `kind: swamp-serve-token`, no `secret` or `secretRef`, and `subject` set to the token's name; the probe reads its expiresAt from `swamp access token list --json`, which carries no secret. Run the audit where the served repository is, and set `swampRepoDir` to it.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1417,22 +1687,31 @@ export const model = {
         let soonestDays: number | null = null;
         let soonestId: string | null = null;
 
+        // Read at most once per audit, and only if an entry needs it.
+        let serveTokens: Promise<ServeTokenListing> | undefined;
+        const deps: ProbeDeps = {
+          serveTokens: () => serveTokens ??= readServeTokenList(globalArgs),
+        };
+
         for (const cred of globalArgs.credentials) {
           // A switch rather than a ternary chain: the compiler now fails the
           // build if a probe kind is added to PROBE_KINDS without a probe
           // behind it, instead of quietly routing it to whichever branch
           // happened to be last.
-          const resolved = await resolveSecret(
-            cred,
-            context.vaultService,
-            context.redactor,
-          );
+          const resolved = SECRETLESS_KINDS.has(cred.kind)
+            ? { secret: "" }
+            : await resolveSecret(
+              cred,
+              context.vaultService,
+              context.redactor,
+            );
           const result: ProbeResult = "secret" in resolved
             ? await probeFor(cred.kind)(
               resolved.secret,
               globalArgs,
               now,
               cred.subject,
+              deps,
             )
             : {
               status: "unresolved",

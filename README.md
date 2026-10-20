@@ -12,7 +12,7 @@ healthy-looking registry.
 | | |
 | --- | --- |
 | Model | `@sntxrr/credential-expiry` |
-| Probes | `jwt` (decode the `exp` claim), `github-pat` (read GitHub's token-expiration response header), `gitlab-pat` (read `expires_at` from GitLab's token self-introspection endpoint, project and group tokens included) |
+| Probes | `jwt` (decode the `exp` claim), `github-pat` (GitHub's token-expiration response header), `gitlab-pat` (GitLab's token self-introspection endpoint), `pve-token` (Proxmox user record), `b2-key` (Backblaze key listing), `scaleway-key` (Scaleway IAM key record), `swamp-serve-token` (swamp serve's own token listing; no secret) |
 | Writes | `credential` per credential, `audit` summary as `current` |
 | Network | Read-only. Every probe is a decode or a `GET`. |
 

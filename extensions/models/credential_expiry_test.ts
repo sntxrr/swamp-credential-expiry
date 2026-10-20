@@ -4,6 +4,7 @@ import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261016
 import {
   AUDIT_INSTANCE,
   classify,
+  type CommandRunner,
   decodeJwtExp,
   model,
   parseB2Secret,
@@ -11,8 +12,11 @@ import {
   parseGithubExpiryHeader,
   parseGitlabExpiryDate,
   parseScalewaySubject,
+  parseServeTokenList,
   PROBE_KINDS,
   probeFor,
+  probeSwampServeToken,
+  readServeTokenList,
   resolveSecret,
   type VaultLike,
 } from "./credential_expiry.ts";
@@ -638,6 +642,8 @@ const B2 = {
   pveBaseUrl: "https://pve.example.com",
   b2BaseUrl: "https://api.backblazeb2.com",
   scwBaseUrl: "https://api.scaleway.com",
+  swampBin: "swamp",
+  swampRepoDir: "",
   timeoutMs: 15000,
 };
 const B2_SECRET = "002abc0123456780000000099:K002aaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1332,3 +1338,226 @@ Deno.test("every probe releases a response body it does not read", async () => {
 });
 
 type ProbeKindName = typeof PROBE_KINDS[number];
+
+// --- swamp-serve-token ----------------------------------------------------------
+
+/** A listing as `swamp access token list --json` prints it (fictional tokens). */
+function serveRow(
+  name: string,
+  expiresAt: string | null,
+  effectiveState = "active",
+): Record<string, unknown> {
+  return {
+    name,
+    principalId: `user:${name}`,
+    principalEmail: null,
+    state: effectiveState,
+    effectiveState,
+    createdAt: "2026-08-01T00:00:00.000Z",
+    expiresAt,
+  };
+}
+
+const SERVE_LIST = JSON.stringify([
+  serveRow("report-bot", "2026-11-18T12:00:00.000Z"),
+  serveRow("old-bot", "2026-12-01T00:00:00.000Z", "revoked"),
+  serveRow("lapsed-bot", "2026-08-01T00:00:00.000Z", "expired"),
+  serveRow("forever-bot", null),
+]);
+
+const serveListing = () => parseServeTokenList(SERVE_LIST);
+
+Deno.test("swamp-serve-token reads expiresAt for the named token", () => {
+  assertEquals(
+    probeSwampServeToken("report-bot", serveListing(), NOW, policy),
+    {
+      status: "ok",
+      expiresAt: "2026-11-18T12:00:00.000Z",
+      daysRemaining: 91,
+      detail: "",
+    },
+  );
+});
+
+Deno.test("swamp-serve-token reports a token missing from the listing as an outage, never as silence", () => {
+  const r = probeSwampServeToken("no-such-bot", serveListing(), NOW, policy);
+  assertEquals(r.status, "authFailed");
+  assertEquals(r.daysRemaining, null);
+  assertEquals(r.detail.startsWith("no server token 'no-such-bot'"), true);
+});
+
+Deno.test("swamp-serve-token treats a revoked token as authFailed despite a future expiresAt", () => {
+  const r = probeSwampServeToken("old-bot", serveListing(), NOW, policy);
+  assertEquals(r.status, "authFailed");
+  assertEquals(r.detail, "server token 'old-bot' is revoked, not active");
+});
+
+Deno.test("swamp-serve-token reports a lapsed token as expired", () => {
+  const r = probeSwampServeToken("lapsed-bot", serveListing(), NOW, policy);
+  assertEquals(r.status, "expired");
+  assertEquals(r.daysRemaining, -18);
+});
+
+Deno.test("swamp-serve-token treats a null expiresAt as noExpiry", () => {
+  assertEquals(
+    probeSwampServeToken("forever-bot", serveListing(), NOW, policy).status,
+    "noExpiry",
+  );
+});
+
+Deno.test("swamp-serve-token refuses a missing subject or a pasted token before looking anything up", () => {
+  assertEquals(
+    probeSwampServeToken(undefined, serveListing(), NOW, policy).detail,
+    "`subject` is required for swamp-serve-token: it names the server token",
+  );
+  const pasted = probeSwampServeToken(
+    "report-bot.0123456789abcdef",
+    serveListing(),
+    NOW,
+    policy,
+  );
+  assertEquals(pasted.status, "authFailed");
+  assertEquals(pasted.detail.includes("0123456789abcdef"), false);
+});
+
+Deno.test("swamp-serve-token reports an unreadable listing as unreachable, not as a missing token", () => {
+  const r = probeSwampServeToken(
+    "report-bot",
+    { detail: "swamp exited 1: boom" },
+    NOW,
+    policy,
+  );
+  assertEquals(r.status, "unreachable");
+  assertEquals(r.detail, "swamp exited 1: boom");
+});
+
+Deno.test("parseServeTokenList refuses output that is not an array of named rows", () => {
+  assertEquals("detail" in parseServeTokenList("not json"), true);
+  assertEquals("detail" in parseServeTokenList("{}"), true);
+  assertEquals("detail" in parseServeTokenList("[{}]"), true);
+  assertEquals(parseServeTokenList("[]"), { tokens: [] });
+});
+
+Deno.test("parseServeTokenList keeps only metadata fields", () => {
+  const got = parseServeTokenList(
+    JSON.stringify([{ ...serveRow("report-bot", null), extra: "x" }]),
+  );
+  assertEquals(got, {
+    tokens: [{
+      name: "report-bot",
+      state: "active",
+      effectiveState: "active",
+      expiresAt: null,
+    }],
+  });
+});
+
+Deno.test("readServeTokenList runs the CLI with --repo-dir and turns failures into a detail", async () => {
+  const calls: string[][] = [];
+  const ok: CommandRunner = (argv) => {
+    calls.push(argv);
+    return Promise.resolve({ code: 0, stdout: SERVE_LIST, stderr: "" });
+  };
+  const got = await readServeTokenList(
+    { swampBin: "swamp", swampRepoDir: "/srv/repo", timeoutMs: 1000 },
+    ok,
+  );
+  assertEquals("tokens" in got && got.tokens.length, 4);
+  assertEquals(calls, [[
+    "swamp",
+    "access",
+    "token",
+    "list",
+    "--json",
+    "--repo-dir",
+    "/srv/repo",
+  ]]);
+
+  const failed = await readServeTokenList(
+    { swampBin: "swamp", swampRepoDir: "", timeoutMs: 1000 },
+    () => Promise.resolve({ code: 1, stdout: "", stderr: "no repo here" }),
+  );
+  assertEquals(failed, {
+    detail: "swamp access token list --json exited 1: no repo here",
+  });
+
+  const missing = await readServeTokenList(
+    { swampBin: "swamp", swampRepoDir: "", timeoutMs: 1000 },
+    () => Promise.reject(new Error("NotFound: swamp")),
+  );
+  assertEquals(
+    "detail" in missing && missing.detail.startsWith("could not run swamp"),
+    true,
+  );
+});
+
+Deno.test("a swamp-serve-token entry takes no secret and needs no vault", () => {
+  const parse = (c: Record<string, unknown>) =>
+    model.globalArguments.safeParse({
+      credentials: [{
+        id: "a",
+        kind: "swamp-serve-token",
+        subject: "report-bot",
+        ...c,
+      }],
+    }).success;
+  assertEquals(parse({}), true);
+  assertEquals(parse({ secret: "x" }), false);
+  assertEquals(parse({ secretRef: { vault: "v", key: "k" } }), false);
+});
+
+Deno.test("audit: serve-token entries share one listing and never touch the vault", async () => {
+  let listings = 0;
+  const vault = fakeVault({});
+  const { context, getWrittenResources } = createModelTestContext({
+    methodName: "audit",
+    globalArgs: model.globalArguments.parse({
+      credentials: [
+        {
+          id: "serve/report-bot",
+          kind: "swamp-serve-token",
+          subject: "report-bot",
+        },
+        {
+          id: "serve/no-such-bot",
+          kind: "swamp-serve-token",
+          subject: "no-such-bot",
+        },
+      ],
+    }),
+  });
+  // Stub the CLI at the probe's seam: the audit reads it through probeFor's deps.
+  const original = Deno.Command;
+  // deno-lint-ignore no-explicit-any
+  (Deno as any).Command = class {
+    output() {
+      listings += 1;
+      return Promise.resolve({
+        code: 0,
+        stdout: new TextEncoder().encode(SERVE_LIST),
+        stderr: new Uint8Array(),
+      });
+    }
+  };
+  try {
+    await model.methods.audit.execute(
+      {} as Record<string, never>,
+      { ...context, vaultService: vault } as unknown as Parameters<
+        typeof model.methods.audit.execute
+      >[1],
+    );
+  } finally {
+    // deno-lint-ignore no-explicit-any
+    (Deno as any).Command = original;
+  }
+
+  const written = Object.fromEntries(
+    getWrittenResources().map((r) => [r.name, r.data]),
+  );
+  assertEquals(listings, 1);
+  assertEquals(vault.reads, []);
+  assertEquals(written["serve-report-bot"].kind, "swamp-serve-token");
+  assertEquals(typeof written["serve-report-bot"].daysRemaining, "number");
+  assertEquals(written["serve-no-such-bot"].status, "authFailed");
+  assertEquals(written[AUDIT_INSTANCE].authFailed, 1);
+});

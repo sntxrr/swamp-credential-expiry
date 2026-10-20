@@ -8,7 +8,8 @@ one useful property: it reads **the same secret the consuming job uses**, so a d
 left behind on a superseded credential shows up as its own finding rather than hiding behind
 a healthy-looking registry.
 
-Read-only by construction. Every probe is a decode or a `GET`; there is no method that can
+Read-only by construction. Every probe is a decode, a `GET`, or a read of swamp's own token
+listing; there is no method that can
 create, rotate or revoke anything.
 
 ## Probes
@@ -21,6 +22,7 @@ create, rotate or revoke anything.
 | `pve-token` | `GET {pveBaseUrl}/api2/json/access/users/{userid}` and reads `tokens[tokenid].expire` from the body. |
 | `b2-key` | `b2_authorize_account`, then `b2_list_keys`, and reads `expirationTimestamp` from the matching key. |
 | `scaleway-key` | `GET {scwBaseUrl}/iam/v1alpha1/api-keys/{subject}` and reads `expires_at` from the body. `subject` is required. |
+| `swamp-serve-token` | Runs `swamp access token list --json` and reads `expiresAt` for the token named by `subject`. Takes **no secret**. |
 
 The GitHub expiry is a header, not a body field, which is why that probe looks like a
 liveness check rather than an API call for data. A token with no expiry simply omits it.
@@ -42,6 +44,18 @@ all. The status codes carry the distinctions: `401` is a refused probe secret (`
 `403` is a probe that authenticates but cannot read IAM (`noExpiry` — a monitoring gap, not an
 outage), and `404` is a watched key absent from the organization (`authFailed`, never
 `noExpiry`).
+
+The swamp serve probe holds **no credential at all**. A server token is presented as
+`<name>.<secret>` and is not a JWT, so there is nothing to decode; but `swamp serve` records
+every token's `expiresAt` in its own token store, and `swamp access token list --json` returns
+that record with no secret in it. The entry names the token in `subject` and sets neither
+`secret` nor `secretRef` (setting one is a configuration error). The listing is read once per
+audit, however many tokens are watched. Run the audit where the served repository lives -- as a
+workflow on the serve itself -- and set `swampRepoDir` to that repository, so a run anywhere
+else fails as `unreachable` instead of reading another repository's tokens. A token missing
+from the listing, or one whose `effectiveState` is not `active`, is `authFailed`: whoever
+presents it is refused today. A `subject` containing a `.` is refused before anything is
+written, because that is the token itself pasted where its name belongs.
 
 The GitLab probe works for **project and group access tokens too** — GitLab implements
 both as personal tokens belonging to a bot user, so they answer the same endpoint.
@@ -178,7 +192,13 @@ globalArguments:
       secret: "${{ vault.get(store, scaleway/expiry-probe) }}"
       subject: SCWEXAMPLEKEY0000001
       note: the transactional-email relay key every host sends through
+    - id: swamp-serve-token/report-bot
+      kind: swamp-serve-token
+      # no secret: the expiry comes from swamp's own token listing
+      subject: report-bot
+      note: the server token the nightly report job authenticates with
   pveBaseUrl: https://pve.example.com
+  swampRepoDir: /srv/swamp-repo
   warnDays: [30, 14, 7]
   criticalDays: 3
 ```
@@ -276,7 +296,7 @@ rounding up would let a credential expire on a day the report called safe.
 ~/.swamp/deno/deno test --allow-net extensions/models/credential_expiry_test.ts
 ```
 
-Tests mock `fetch`; there are no live calls, and no probe in this model can
+Tests mock `fetch` and the swamp CLI; there are no live calls, and no probe in this model can
 mutate anything.
 
 ## License
