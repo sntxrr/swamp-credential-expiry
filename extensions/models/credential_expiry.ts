@@ -39,7 +39,15 @@
  *    page somebody over a credential that is doing its job. Each probe decides
  *    for its own provider rather than sharing one rule.
  *
- * 4. **Read-only, by construction.** Every probe here is a decode or a GET.
+ * 4. **One unreadable secret is one finding, not a dead audit.** An entry can
+ *    name its secret as a vault reference (`secretRef`) instead of an inline
+ *    `vault.get()`. Inline expressions are resolved before the method runs, so
+ *    a single missing vault item kills the step and every other credential
+ *    goes unchecked with it. A `secretRef` is resolved here, per entry, and a
+ *    failure is reported as that entry's `unresolved` status -- the others are
+ *    still probed.
+ *
+ * 5. **Read-only, by construction.** Every probe here is a decode or a GET.
  *    There is no method that can create, rotate or revoke anything, which is
  *    what makes it safe to run unattended on a schedule against production
  *    credentials. Rotation deliberately lives elsewhere — see
@@ -66,9 +74,12 @@ export type ProbeKind = typeof PROBE_KINDS[number];
  * Outcomes, ordered worst-first. `authFailed` outranks `expired` because a
  * credential that is refused *now* is an outage, whereas one that lapsed at
  * some point may already have been replaced everywhere that matters.
+ * `unresolved` sits next to it: the monitor could not read the secret, so the
+ * credential's state is unknown, and unknown is not a pass.
  */
 export const STATUSES = [
   "authFailed",
+  "unresolved",
   "expired",
   "critical",
   "warn",
@@ -78,6 +89,15 @@ export const STATUSES = [
 ] as const;
 /** One of the reportable outcomes, narrowed from {@link STATUSES}. */
 export type Status = typeof STATUSES[number];
+
+const SecretRefSchema = z.object({
+  vault: z.string().min(1).describe(
+    "Name of the swamp vault holding the secret.",
+  ),
+  key: z.string().min(1).describe(
+    "Key within that vault, exactly as vault.get() would take it, e.g. item/field.",
+  ),
+});
 
 const CredentialInputSchema = z.object({
   id: z.string().min(1).describe(
@@ -91,8 +111,14 @@ const CredentialInputSchema = z.object({
       "`b2-key` reads Backblaze B2's key listing, which embeds each key's expirationTimestamp; " +
       "`scaleway-key` reads a Scaleway IAM API key record, which carries expires_at.",
   ),
-  secret: z.string().min(1).meta({ sensitive: true }).describe(
-    "The credential itself. Supply via vault.get() — never inline. This is the same value the consuming job uses, deliberately: see module docs.",
+  secret: z.string().min(1).meta({ sensitive: true }).optional().describe(
+    "The credential itself. Supply via vault.get() or env — never inline. This is the same value the consuming job uses, deliberately: see module docs. " +
+      "Prefer `secretRef` for vault-held secrets: an inline vault.get() that cannot be resolved fails the whole audit before any credential is probed.",
+  ),
+  secretRef: SecretRefSchema.optional().describe(
+    "Where to read the credential from, resolved by the method itself, per entry. " +
+      "A secret that cannot be read is reported as this entry's `unresolved` status " +
+      "instead of failing the run. Set exactly one of `secret` and `secretRef`.",
   ),
   note: z.string().default("").describe(
     "Free text carried onto the resource, e.g. which job would break. Shown in alerts.",
@@ -107,6 +133,8 @@ const CredentialInputSchema = z.object({
       "widen the blast radius the scoping was for. A separate read-only credential reads on " +
       "its behalf instead. Never a secret: subjects are written into resources in clear.",
   ),
+}).refine((c) => (c.secret === undefined) !== (c.secretRef === undefined), {
+  message: "set exactly one of `secret` and `secretRef`",
 });
 
 const GlobalArgsSchema = z.object({
@@ -169,6 +197,7 @@ const AuditSchema = z.object({
   critical: z.number(),
   expired: z.number(),
   authFailed: z.number(),
+  unresolved: z.number(),
   unreachable: z.number(),
   noExpiry: z.number(),
   /** Worst (smallest) daysRemaining across everything that HAS an expiry. */
@@ -308,8 +337,8 @@ export function shouldNotify(
   policy: { warnDays: number[]; criticalDays: number },
 ): { notify: boolean; reason: string } {
   const urgent = results.filter((r) =>
-    r.status === "authFailed" || r.status === "expired" ||
-    r.status === "unreachable"
+    r.status === "authFailed" || r.status === "unresolved" ||
+    r.status === "expired" || r.status === "unreachable"
   );
   if (urgent.length > 0) {
     return { notify: true, reason: urgent[0].status };
@@ -325,6 +354,60 @@ export function shouldNotify(
   return crossing
     ? { notify: true, reason: "threshold" }
     : { notify: false, reason: "" };
+}
+
+/** The part of swamp's vault service this model uses. */
+export type VaultLike = {
+  get: (vaultName: string, key: string) => Promise<string>;
+};
+
+/** Longest vault error carried into a resource and an alert body. */
+const MAX_UNRESOLVED_DETAIL = 300;
+
+/**
+ * Get one entry's secret, or say why it could not be read.
+ *
+ * Never throws: a failure here is the entry's finding, not the run's. The
+ * returned detail names the vault and key -- addresses, not values -- plus the
+ * vault's own error, which describes a lookup and holds no secret material.
+ * A resolved value is registered with the redactor before anything else can
+ * log it.
+ */
+export async function resolveSecret(
+  cred: { secret?: string; secretRef?: { vault: string; key: string } },
+  vault: VaultLike | undefined,
+  redactor?: { addSecret: (value: string) => void },
+): Promise<{ secret: string } | { detail: string }> {
+  if (cred.secret !== undefined) return { secret: cred.secret };
+  const ref = cred.secretRef;
+  if (!ref) return { detail: "entry has neither secret nor secretRef" };
+  const where = `${ref.vault}/${ref.key}`;
+  if (!vault) {
+    return { detail: `no vault service available to read ${where}` };
+  }
+  let value: string;
+  try {
+    value = await vault.get(ref.vault, ref.key);
+  } catch (e) {
+    const msg = (e instanceof Error ? e.message : String(e)).replace(
+      /\s+/g,
+      " ",
+    )
+      .trim();
+    const detail = `could not read ${where}: ${msg}`;
+    return {
+      detail: detail.length > MAX_UNRESOLVED_DETAIL
+        ? `${detail.slice(0, MAX_UNRESOLVED_DETAIL - 1)}…`
+        : detail,
+    };
+  }
+  if (typeof value !== "string" || value === "") {
+    // An empty read is a failure, never a pass: 1Password has answered an
+    // empty value with exit 0 before.
+    return { detail: `${where} resolved to an empty value` };
+  }
+  redactor?.addSecret(value);
+  return { secret: value };
 }
 
 /** Map days-remaining onto a status, given the configured thresholds. */
@@ -1199,7 +1282,7 @@ export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.09.30.1",
+  version: "2026.10.20.1",
   // Purely additive: a fourth probe kind and the `pveBaseUrl` global argument
   // that serves it. No stored attribute changes shape, so the migration is a
   // no-op -- but it has to be DECLARED, or existing instances pin themselves to
@@ -1226,6 +1309,12 @@ export const model = {
       toVersion: "2026.09.30.1",
       description:
         "Adds the `scaleway-key` probe kind and the `scwBaseUrl` global argument, and declares the `b2-key` kind shipped in 2026.09.09.1 without a model version bump. Nothing to migrate: the credential and audit resource schemas are unchanged. To monitor a Scaleway API key, add an entry with `kind: scaleway-key` whose secret is a read-only probe key's secret (IAM read at organization scope) and whose `subject` is the access key id being watched -- required, because a Scaleway secret does not identify its own access key.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.20.1",
+      description:
+        "Adds the optional `secretRef: {vault, key}` field and the `unresolved` status. Nothing to migrate: `secret` still works exactly as before. An entry that names `secretRef` instead is read by the method itself, so a missing or unreadable vault item is reported as that entry's `unresolved` status (counted in the new `unresolved` audit field, and alerted immediately like `authFailed`) rather than failing the whole audit before any credential is probed. Set exactly one of `secret` and `secretRef` per entry.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1261,6 +1350,8 @@ export const model = {
             name: string,
             data: Record<string, unknown>,
           ) => Promise<{ name: string }>;
+          vaultService?: VaultLike;
+          redactor?: { addSecret: (value: string) => void };
         },
       ) => {
         const { globalArgs, logger } = context;
@@ -1281,6 +1372,7 @@ export const model = {
         const handles: Array<{ name: string }> = [];
         const counts: Record<Status, number> = {
           authFailed: 0,
+          unresolved: 0,
           expired: 0,
           critical: 0,
           warn: 0,
@@ -1300,12 +1392,24 @@ export const model = {
           // build if a probe kind is added to PROBE_KINDS without a probe
           // behind it, instead of quietly routing it to whichever branch
           // happened to be last.
-          const result = await probeFor(cred.kind)(
-            cred.secret,
-            globalArgs,
-            now,
-            cred.subject,
+          const resolved = await resolveSecret(
+            cred,
+            context.vaultService,
+            context.redactor,
           );
+          const result: ProbeResult = "secret" in resolved
+            ? await probeFor(cred.kind)(
+              resolved.secret,
+              globalArgs,
+              now,
+              cred.subject,
+            )
+            : {
+              status: "unresolved",
+              expiresAt: null,
+              daysRemaining: null,
+              detail: resolved.detail,
+            };
 
           counts[result.status] += 1;
           outcomes.push({
@@ -1361,8 +1465,8 @@ export const model = {
         // debt that belongs in a review, not a nightly page — and a page that
         // fires every night over an unchanged fact is one that gets muted.
         const actionable =
-          counts.authFailed + counts.expired + counts.critical +
-              counts.warn + counts.unreachable > 0;
+          counts.authFailed + counts.unresolved + counts.expired +
+              counts.critical + counts.warn + counts.unreachable > 0;
 
         logger.info(
           "{total} credentials probed; {actionable}",

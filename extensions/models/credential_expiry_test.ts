@@ -3,6 +3,7 @@ import { assertEquals } from "jsr:@std/assert@1";
 import {
   classify,
   decodeJwtExp,
+  model,
   parseB2Secret,
   parseB2Subject,
   parseGithubExpiryHeader,
@@ -10,6 +11,8 @@ import {
   parseScalewaySubject,
   PROBE_KINDS,
   probeFor,
+  resolveSecret,
+  type VaultLike,
 } from "./credential_expiry.ts";
 
 /** Build an unsigned-but-well-formed JWT with the given payload. */
@@ -1085,5 +1088,165 @@ Deno.test("scaleway-key tolerates a trailing slash on scwBaseUrl", async () => {
   assertEquals(
     seen,
     `https://api.scaleway.com/iam/v1alpha1/api-keys/${SCW_SUBJECT}`,
+  );
+});
+
+// --- secretRef: per-entry resolution ------------------------------------------
+
+/** A vault holding exactly `items`; anything else fails like a missing item. */
+function fakeVault(
+  items: Record<string, string>,
+): VaultLike & { reads: string[] } {
+  const reads: string[] = [];
+  return {
+    reads,
+    get: (vaultName: string, key: string) => {
+      reads.push(`${vaultName}/${key}`);
+      const v = items[`${vaultName}/${key}`];
+      return v === undefined
+        ? Promise.reject(
+          new Error(`could not read secret '${key}': Found 0 item(s) in vault`),
+        )
+        : Promise.resolve(v);
+    },
+  };
+}
+
+Deno.test("resolveSecret passes an inline secret through without touching the vault", async () => {
+  const vault = fakeVault({});
+  assertEquals(await resolveSecret({ secret: "abc" }, vault), {
+    secret: "abc",
+  });
+  assertEquals(vault.reads, []);
+});
+
+Deno.test("resolveSecret reads a secretRef and registers the value for redaction", async () => {
+  const redacted: string[] = [];
+  const got = await resolveSecret(
+    { secretRef: { vault: "store", key: "bot/token" } },
+    fakeVault({ "store/bot/token": "s3cr3t" }),
+    { addSecret: (v) => redacted.push(v) },
+  );
+  assertEquals(got, { secret: "s3cr3t" });
+  assertEquals(redacted, ["s3cr3t"]);
+});
+
+Deno.test("resolveSecret turns a missing item into a detail, never a throw", async () => {
+  const got = await resolveSecret(
+    { secretRef: { vault: "store", key: "gone/token" } },
+    fakeVault({}),
+  );
+  assertEquals("detail" in got, true);
+  const detail = (got as { detail: string }).detail;
+  assertEquals(detail.startsWith("could not read store/gone/token: "), true);
+  assertEquals(detail.includes("Found 0 item(s)"), true);
+});
+
+Deno.test("resolveSecret treats an empty read as a failure, not a pass", async () => {
+  assertEquals(
+    await resolveSecret(
+      { secretRef: { vault: "store", key: "bot/token" } },
+      fakeVault({ "store/bot/token": "" }),
+    ),
+    { detail: "store/bot/token resolved to an empty value" },
+  );
+});
+
+Deno.test("resolveSecret reports a missing vault service rather than crashing", async () => {
+  assertEquals(
+    await resolveSecret({ secretRef: { vault: "store", key: "k" } }, undefined),
+    { detail: "no vault service available to read store/k" },
+  );
+});
+
+Deno.test("resolveSecret caps a long vault error", async () => {
+  const vault: VaultLike = {
+    get: () => Promise.reject(new Error("x".repeat(5000))),
+  };
+  const got = await resolveSecret(
+    { secretRef: { vault: "v", key: "k" } },
+    vault,
+  );
+  assertEquals((got as { detail: string }).detail.length, 300);
+});
+
+Deno.test("an entry must set exactly one of secret and secretRef", () => {
+  const parse = (c: Record<string, unknown>) =>
+    model.globalArguments.safeParse({
+      credentials: [{ id: "a", kind: "jwt", ...c }],
+    })
+      .success;
+  assertEquals(parse({ secret: "x" }), true);
+  assertEquals(parse({ secretRef: { vault: "v", key: "k" } }), true);
+  assertEquals(parse({}), false);
+  assertEquals(
+    parse({ secret: "x", secretRef: { vault: "v", key: "k" } }),
+    false,
+  );
+});
+
+Deno.test("audit: one unreadable secretRef is that entry's finding; every other entry is still probed", async () => {
+  const future = Math.floor(Date.now() / 1000) + 200 * 86_400;
+  const written: Record<string, Record<string, unknown>> = {};
+  const redacted: string[] = [];
+  const globalArgs = model.globalArguments.parse({
+    credentials: [
+      { id: "inline/one", kind: "jwt", secret: jwt({ exp: future }) },
+      {
+        id: "missing/two",
+        kind: "jwt",
+        secretRef: { vault: "store", key: "gone/token" },
+      },
+      {
+        id: "ref/three",
+        kind: "jwt",
+        secretRef: { vault: "store", key: "bot/token" },
+      },
+    ],
+  });
+  const resolvedJwt = jwt({ exp: future, jti: "from-the-vault" });
+  await model.methods.audit.execute({} as Record<string, never>, {
+    globalArgs,
+    logger: { info: () => {}, warn: () => {} },
+    writeResource: (_spec, name, data) => {
+      written[name] = data;
+      return Promise.resolve({ name });
+    },
+    vaultService: fakeVault({ "store/bot/token": resolvedJwt }),
+    redactor: { addSecret: (v) => redacted.push(v) },
+  });
+
+  assertEquals(written["inline-one"].status, "ok");
+  assertEquals(written["ref-three"].status, "ok");
+  assertEquals(written["missing-two"].status, "unresolved");
+  assertEquals(written["missing-two"].daysRemaining, null);
+  assertEquals(redacted, [resolvedJwt]);
+
+  const audit = written["current"];
+  assertEquals(audit.total, 3);
+  assertEquals(audit.ok, 2);
+  assertEquals(audit.unresolved, 1);
+  assertEquals(audit.authFailed, 0);
+  assertEquals(audit.actionable, true);
+  assertEquals(audit.notifyToday, true);
+  assertEquals(audit.notifyReason, "unresolved");
+  assertEquals(
+    String(audit.summary).startsWith(
+      "UNRESOLVED missing/two — could not read store/gone/token",
+    ),
+    true,
+  );
+  // Nothing written anywhere may carry a secret value.
+  const blob = JSON.stringify(written);
+  assertEquals(blob.includes(resolvedJwt), false);
+});
+
+Deno.test("shouldNotify treats unresolved as outage-shaped", () => {
+  assertEquals(
+    shouldNotify([{ status: "unresolved", daysRemaining: null }], {
+      warnDays: [30, 14, 7],
+      criticalDays: 3,
+    }),
+    { notify: true, reason: "unresolved" },
   );
 });

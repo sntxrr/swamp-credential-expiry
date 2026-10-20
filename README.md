@@ -65,14 +65,16 @@ globalArguments:
       note: every scheduled deploy resolves its secrets through this
     - id: pat/dependency-sweep
       kind: github-pat
-      secret: '${{ vault.get(store, sweep/pat) }}'
+      secretRef: {vault: store, key: sweep/pat}
       note: the weekly sweep alerts only on success, so expiry is silent
   warnDays: [30, 14, 7]
   criticalDays: 3
 ```
 
-Always supply `secret` through `vault.get()`. It is marked sensitive, is never logged, and
-never reaches a resource — only the id, the expiry and the status leave the method.
+Never inline a secret: use `secretRef: {vault, key}` or `secret: '${{ vault.get(...) }}'`.
+A `secretRef` is read per entry, so a missing vault item is reported as that entry's
+`unresolved` status rather than failing the whole audit. Either way the value is never
+logged and never reaches a resource. Only the id, the expiry and the status leave the method.
 
 ## Development
 
