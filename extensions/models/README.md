@@ -92,6 +92,7 @@ Ordered worst-first.
 | Status | Meaning |
 |---|---|
 | `authFailed` | Refused **now** (401/403), or a value that will not parse. An outage in progress, not a warning — thresholds do not apply. |
+| `unresolved` | A `secretRef` could not be read from its vault, so the credential's state is **unknown**. The other entries are still probed. |
 | `expired` | Past its expiry. |
 | `critical` | At or below `criticalDays`. |
 | `warn` | Within the widest `warnDays` threshold. |
@@ -109,6 +110,8 @@ Three of these distinctions exist because collapsing them produces a worse alert
 - **`authFailed` is not `expired`.** A credential being refused right now is an outage.
   A credential that lapsed at some point may already have been replaced everywhere.
 - **`unreachable` is not either.** Otherwise a DNS blip reads as a dead credential.
+- **`unresolved` is not `authFailed`.** The monitor could not read the secret; nothing
+  was asked of the provider. It is alerted just as fast, because unknown is not a pass.
 
 ## Alerting: gate on `notifyToday`, not on `actionable`
 
@@ -119,7 +122,7 @@ the monitor has made things worse than no monitor.
 
 `notifyToday` is the gate. It fires:
 
-- **immediately** for anything outage-shaped (`authFailed`, `expired`, `unreachable`);
+- **immediately** for anything outage-shaped (`authFailed`, `unresolved`, `expired`, `unreachable`);
 - on the **exact day** a `warnDays` threshold is crossed;
 - **every day** once inside `criticalDays`;
 - **never** for `noExpiry` or `ok`.
@@ -151,7 +154,8 @@ globalArguments:
       note: every scheduled deploy resolves its secrets through this
     - id: pat/dependency-sweep
       kind: github-pat
-      secret: '${{ vault.get(store, sweep/pat) }}'
+      # read by the method itself: a missing item is this entry's `unresolved`
+      secretRef: {vault: store, key: sweep/pat}
       note: the weekly sweep alerts only on success, so expiry is silent
     - id: gitlab/mirror-sync
       kind: gitlab-pat
@@ -179,9 +183,19 @@ globalArguments:
   criticalDays: 3
 ```
 
-Always supply `secret` through `vault.get()`. The value is marked sensitive, is
-never logged, and is never written to a resource — only the id, the expiry and
-the status leave the method.
+Never inline a secret. Each entry takes exactly one of:
+
+- **`secretRef: {vault, key}`** (preferred for vault-held secrets). The method reads
+  it per entry. A missing or unreadable item becomes that entry's `unresolved` status,
+  and every other credential is still probed.
+- **`secret`**, through `vault.get()` or `env`. The expression is resolved *before*
+  the method runs, so one unresolvable `vault.get()` fails the whole audit and no
+  credential is checked. Keep it for values that are not in a vault, such as an
+  environment variable.
+
+Either way the value is never logged and never written to a resource. A value read
+through `secretRef` is registered with swamp's redactor as soon as it is read. Only
+the id, the expiry and the status leave the method.
 
 ### Run an audit
 
