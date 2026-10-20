@@ -111,10 +111,13 @@ const CredentialInputSchema = z.object({
       "`b2-key` reads Backblaze B2's key listing, which embeds each key's expirationTimestamp; " +
       "`scaleway-key` reads a Scaleway IAM API key record, which carries expires_at.",
   ),
+  // `sensitive` is set on BOTH sides of `.optional()`: each wrapper is its own
+  // schema with its own metadata, so a flag set only inside is invisible to
+  // anything that reads the field's outer schema.
   secret: z.string().min(1).meta({ sensitive: true }).optional().describe(
     "The credential itself. Supply via vault.get() or env — never inline. This is the same value the consuming job uses, deliberately: see module docs. " +
       "Prefer `secretRef` for vault-held secrets: an inline vault.get() that cannot be resolved fails the whole audit before any credential is probed.",
-  ),
+  ).meta({ sensitive: true }),
   secretRef: SecretRefSchema.optional().describe(
     "Where to read the credential from, resolved by the method itself, per entry. " +
       "A secret that cannot be read is reported as this entry's `unresolved` status " +
@@ -292,6 +295,9 @@ export function resourceNameFor(id: string): string {
   return id.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+/** Instance name of the audit summary; no credential may normalise to it. */
+export const AUDIT_INSTANCE = "current";
+
 /**
  * Fail before probing anything, not halfway through.
  *
@@ -313,6 +319,13 @@ export function preflight(
     if (!name) {
       problems.push(`id has no usable characters for a resource name: ${c.id}`);
       continue;
+    }
+    if (name === AUDIT_INSTANCE) {
+      // The summary is written under this name; a credential written there too
+      // would be overwritten by it, and data.latest() would return the wrong shape.
+      problems.push(
+        `id "${c.id}" normalises to "${AUDIT_INSTANCE}", which the audit summary uses`,
+      );
     }
     const clash = byName.get(name);
     if (clash && clash !== c.id) {
@@ -507,6 +520,10 @@ async function probeGithubPat(
     };
   }
 
+  // Everything this probe reads is in the headers. Release the body on every
+  // path, or each probe leaves a connection open until garbage collection.
+  await res.body?.cancel();
+
   if (res.status === 401 || res.status === 403) {
     // Already an outage. Thresholds are meaningless for a credential being
     // refused right now.
@@ -580,6 +597,9 @@ async function probeGitlabPat(
       detail: `request failed: ${String(cause)}`,
     };
   }
+
+  // Only a 2xx body is read; release any other, or the connection stays open.
+  if (!res.ok) await res.body?.cancel();
 
   if (res.status === 401) {
     return {
@@ -776,6 +796,9 @@ async function probePveToken(
     };
   }
 
+  // Only a 2xx body is read; release any other, or the connection stays open.
+  if (!res.ok) await res.body?.cancel();
+
   if (res.status === 401) {
     return {
       status: "authFailed",
@@ -945,6 +968,8 @@ async function probeB2Key(
       detail: `authorize request failed: ${String(cause)}`,
     };
   }
+  // Only a 2xx body is read; release any other, or the connection stays open.
+  if (!authRes.ok) await authRes.body?.cancel();
   if (authRes.status === 401) {
     return {
       status: "authFailed",
@@ -1029,6 +1054,7 @@ async function probeB2Key(
     };
   }
   if (!listRes.ok) {
+    await listRes.body?.cancel();
     return {
       status: "unreachable",
       expiresAt: null,
@@ -1367,6 +1393,10 @@ export const model = {
           );
         }
 
+        logger.info("Auditing {total} credentials", {
+          total: globalArgs.credentials.length,
+        });
+
         const now = new Date();
         const checkedAt = now.toISOString();
         const handles: Array<{ name: string }> = [];
@@ -1438,10 +1468,18 @@ export const model = {
 
           // The secret is never logged, and never written to a resource. Only
           // its id, its expiry and its status leave this method.
-          logger.info("{id}: {status}", {
-            id: cred.id,
-            status: result.status,
-          });
+          if (result.status === "unresolved") {
+            // The detail names a vault and key, never a value.
+            logger.warn("{id}: secret could not be read: {detail}", {
+              id: cred.id,
+              detail: result.detail,
+            });
+          } else {
+            logger.info("{id}: {status}", {
+              id: cred.id,
+              status: result.status,
+            });
+          }
 
           handles.push(
             await context.writeResource(
@@ -1479,7 +1517,7 @@ export const model = {
         const { notify, reason } = shouldNotify(outcomes, globalArgs);
 
         handles.push(
-          await context.writeResource("audit", "current", {
+          await context.writeResource("audit", AUDIT_INSTANCE, {
             checkedAt,
             total: globalArgs.credentials.length,
             ...counts,

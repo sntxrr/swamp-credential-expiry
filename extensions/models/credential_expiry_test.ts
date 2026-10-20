@@ -1,6 +1,8 @@
 // extensions/models/credential_expiry_test.ts
 import { assertEquals } from "jsr:@std/assert@1";
+import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261016.58";
 import {
+  AUDIT_INSTANCE,
   classify,
   decodeJwtExp,
   model,
@@ -1187,42 +1189,46 @@ Deno.test("an entry must set exactly one of secret and secretRef", () => {
 
 Deno.test("audit: one unreadable secretRef is that entry's finding; every other entry is still probed", async () => {
   const future = Math.floor(Date.now() / 1000) + 200 * 86_400;
-  const written: Record<string, Record<string, unknown>> = {};
-  const redacted: string[] = [];
-  const globalArgs = model.globalArguments.parse({
-    credentials: [
-      { id: "inline/one", kind: "jwt", secret: jwt({ exp: future }) },
-      {
-        id: "missing/two",
-        kind: "jwt",
-        secretRef: { vault: "store", key: "gone/token" },
-      },
-      {
-        id: "ref/three",
-        kind: "jwt",
-        secretRef: { vault: "store", key: "bot/token" },
-      },
-    ],
-  });
   const resolvedJwt = jwt({ exp: future, jti: "from-the-vault" });
-  await model.methods.audit.execute({} as Record<string, never>, {
-    globalArgs,
-    logger: { info: () => {}, warn: () => {} },
-    writeResource: (_spec, name, data) => {
-      written[name] = data;
-      return Promise.resolve({ name });
-    },
-    vaultService: fakeVault({ "store/bot/token": resolvedJwt }),
-    redactor: { addSecret: (v) => redacted.push(v) },
-  });
+  const redacted: string[] = [];
+  const { context, getWrittenResources, getLogsByLevel } =
+    createModelTestContext({
+      methodName: "audit",
+      globalArgs: model.globalArguments.parse({
+        credentials: [
+          { id: "inline/one", kind: "jwt", secret: jwt({ exp: future }) },
+          {
+            id: "missing/two",
+            kind: "jwt",
+            secretRef: { vault: "store", key: "gone/token" },
+          },
+          {
+            id: "ref/three",
+            kind: "jwt",
+            secretRef: { vault: "store", key: "bot/token" },
+          },
+        ],
+      }),
+    });
+  await model.methods.audit.execute(
+    {} as Record<string, never>,
+    {
+      ...context,
+      vaultService: fakeVault({ "store/bot/token": resolvedJwt }),
+      redactor: { addSecret: (v: string) => redacted.push(v) },
+    } as unknown as Parameters<typeof model.methods.audit.execute>[1],
+  );
 
+  const written = Object.fromEntries(
+    getWrittenResources().map((r) => [r.name, r.data]),
+  );
   assertEquals(written["inline-one"].status, "ok");
   assertEquals(written["ref-three"].status, "ok");
   assertEquals(written["missing-two"].status, "unresolved");
   assertEquals(written["missing-two"].daysRemaining, null);
   assertEquals(redacted, [resolvedJwt]);
 
-  const audit = written["current"];
+  const audit = written[AUDIT_INSTANCE];
   assertEquals(audit.total, 3);
   assertEquals(audit.ok, 2);
   assertEquals(audit.unresolved, 1);
@@ -1236,8 +1242,14 @@ Deno.test("audit: one unreadable secretRef is that entry's finding; every other 
     ),
     true,
   );
-  // Nothing written anywhere may carry a secret value.
-  const blob = JSON.stringify(written);
+  assertEquals(getLogsByLevel("warning").length, 1);
+
+  // Nothing written or logged may carry a vault-read value.
+  const blob = JSON.stringify([
+    getWrittenResources(),
+    getLogsByLevel("info"),
+    getLogsByLevel("warning"),
+  ]);
   assertEquals(blob.includes(resolvedJwt), false);
 });
 
@@ -1250,3 +1262,73 @@ Deno.test("shouldNotify treats unresolved as outage-shaped", () => {
     { notify: true, reason: "unresolved" },
   );
 });
+
+Deno.test("secret stays marked sensitive through .optional()", () => {
+  // Each zod wrapper carries its own metadata. Marking only the inner string
+  // left the field's outer schema without the flag (caught in review).
+  const cred = (model.globalArguments.shape.credentials as unknown as {
+    element: { shape: Record<string, { meta: () => Record<string, unknown> }> };
+  }).element;
+  assertEquals(cred.shape.secret.meta()?.sensitive, true);
+});
+
+Deno.test("preflight refuses an id that would overwrite the audit summary", () => {
+  assertEquals(
+    preflight([{ id: "current" }]),
+    [`id "current" normalises to "${AUDIT_INSTANCE}", which the audit summary uses`],
+  );
+  assertEquals(preflight([{ id: "/current/" }]).length, 1);
+  assertEquals(preflight([{ id: "current-token" }]), []);
+});
+
+/** A response whose body records whether it was released. */
+function trackedResponse(status: number, body = "{}") {
+  const state = { released: false };
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(new TextEncoder().encode(body));
+      c.close();
+    },
+    cancel() {
+      state.released = true;
+    },
+  });
+  const res = new Response(stream, { status });
+  return { res, state };
+}
+
+Deno.test("every probe releases a response body it does not read", async () => {
+  const cases: Array<[string, ProbeKindName, string, number]> = [
+    ["github 200", "github-pat", "ghp_x", 200],
+    ["github 401", "github-pat", "ghp_x", 401],
+    ["github 500", "github-pat", "ghp_x", 500],
+    ["gitlab 401", "gitlab-pat", "glpat-x", 401],
+    ["gitlab 403", "gitlab-pat", "glpat-x", 403],
+    ["gitlab 500", "gitlab-pat", "glpat-x", 500],
+    ["pve 401", "pve-token", PVE_SECRET, 401],
+    ["pve 403", "pve-token", PVE_SECRET, 403],
+    ["pve 500", "pve-token", PVE_SECRET, 500],
+    ["b2 authorize 401", "b2-key", B2_SECRET, 401],
+    ["b2 authorize 500", "b2-key", B2_SECRET, 500],
+  ];
+  for (const [name, kind, secret, status] of cases) {
+    const t = trackedResponse(status);
+    await withFetch(
+      () => t.res,
+      () =>
+        Promise.resolve(probeFor(kind)(secret, { ...GL, ...PVE, ...B2 }, NOW)),
+    );
+    assertEquals(t.state.released || t.res.bodyUsed, true, name);
+  }
+
+  // b2_list_keys failing after a good authorize.
+  const list = trackedResponse(500);
+  const auth = b2Fetch([]);
+  await withFetch(
+    (url) => url.includes("b2_list_keys") ? list.res : auth(url),
+    () => Promise.resolve(probeFor("b2-key")(B2_SECRET, B2, NOW)),
+  );
+  assertEquals(list.state.released || list.res.bodyUsed, true, "b2 list 500");
+});
+
+type ProbeKindName = typeof PROBE_KINDS[number];
