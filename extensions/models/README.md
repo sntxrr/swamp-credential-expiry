@@ -274,6 +274,57 @@ globalArguments:
   timeoutMs: 15000
 ```
 
+## Sweeping the Scaleway plane
+
+Every probe kind reports on one named credential, so a key nobody added to the
+model is invisible to `audit`: it never alerts, and nothing reports that it
+exists. The `sweep` method closes that for Scaleway. It lists every API key in
+the organization and compares the listing with the `subject`s of the model's
+`scaleway-key` entries:
+
+- `unmanifested` — keys in the organization that no entry names;
+- `noExpiry` — keys with no expiry, manifested or not.
+
+```yaml
+globalArguments:
+  scwOrganizationId: 00000000-0000-0000-0000-000000000000  # required; not a secret
+  credentials:
+    - id: scaleway/probe
+      kind: scaleway-key
+      secretRef: {vault: my-vault, key: scaleway-probe/secret}
+      subject: SCWEXAMPLEKEY0000001
+```
+
+```bash
+swamp model @sntxrr/credential-expiry method run sweep credential-expiry
+# or name the entry to authenticate as, when entries use different secrets
+swamp model @sntxrr/credential-expiry method run sweep credential-expiry --input credentialId=scaleway/probe
+```
+
+The sweep authenticates as a `scaleway-key` entry's secret, which needs IAM read
+(users and applications) at organization scope — the same read-only key the
+`scaleway-key` probes use. With no `credentialId` it uses that secret only when
+every `scaleway-key` entry shares it, and otherwise refuses to guess.
+
+The sweep never throws over the plane. Every outcome is written to the `sweep`
+resource, instance `sweep-scaleway`, with `status` set to one of `ok`,
+`findings`, `authFailed` (401 or a malformed secret), `unresolved` (the vault
+read failed), `misconfigured` (no or bad `scwOrganizationId`, 400, 403, or no
+usable entry), or `unreachable` (network, unexpected status, malformed or
+truncated listing). `notify` is true for everything except `ok`, so a sweep that
+cannot see the plane alerts through the same path as one that found something.
+Gate a notify step on it:
+
+```yaml
+  - name: notify-sweep
+    model: apprise
+    method: notify
+    if: '${{ data.latest("credential-expiry", "sweep-scaleway").attributes.notify }}'
+    inputs:
+      title: '${{ data.latest("credential-expiry", "sweep-scaleway").attributes.notifyReason }}'
+      body: '${{ data.latest("credential-expiry", "sweep-scaleway").attributes.summary }}'
+```
+
 ## Resources
 
 `credential` — one per probed credential: `status`, `expiresAt`, `daysRemaining`,
@@ -285,6 +336,13 @@ the same name abort the run rather than silently overwrite one another.
 `soonestId`, the `actionable` and `notifyToday` booleans, `notifyReason`, and a
 `summary` string of one line per non-ok credential, ready to drop into a
 notification body.
+
+`sweep` — written as instance `sweep-scaleway` by the `sweep` method: `status`,
+`detail`, `total` keys in the organization, `manifested`, the `unmanifested` and
+`noExpiry` access key lists, `keys` (access key, bearer, description, created and
+expiry dates; never a secret), `notify`, `notifyReason`, and a `summary` of one
+line per finding. A credential id that normalises to `current` or
+`sweep-scaleway` aborts the run.
 
 `daysRemaining` is floored, never rounded: 0.9 days left reads as `0`, because
 rounding up would let a credential expire on a day the report called safe.

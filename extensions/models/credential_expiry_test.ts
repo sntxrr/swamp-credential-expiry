@@ -5,7 +5,9 @@ import {
   AUDIT_INSTANCE,
   classify,
   type CommandRunner,
+  compareScalewayPlane,
   decodeJwtExp,
+  listScalewayKeys,
   model,
   parseB2Secret,
   parseB2Subject,
@@ -13,11 +15,14 @@ import {
   parseGitlabExpiryDate,
   parseScalewaySubject,
   parseServeTokenList,
+  pickSweepCredential,
   PROBE_KINDS,
   probeFor,
   probeSwampServeToken,
   readServeTokenList,
   resolveSecret,
+  SCW_PAGE_SIZE,
+  SWEEP_INSTANCE,
   type VaultLike,
 } from "./credential_expiry.ts";
 
@@ -642,6 +647,7 @@ const B2 = {
   pveBaseUrl: "https://pve.example.com",
   b2BaseUrl: "https://api.backblazeb2.com",
   scwBaseUrl: "https://api.scaleway.com",
+  scwOrganizationId: "",
   swampBin: "swamp",
   swampRepoDir: "",
   timeoutMs: 15000,
@@ -1560,4 +1566,409 @@ Deno.test("audit: serve-token entries share one listing and never touch the vaul
   assertEquals(typeof written["serve-report-bot"].daysRemaining, "number");
   assertEquals(written["serve-no-such-bot"].status, "authFailed");
   assertEquals(written[AUDIT_INSTANCE].authFailed, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Scaleway plane sweep
+// ---------------------------------------------------------------------------
+
+// Fictional values only: these fixtures ship in a public repository.
+const SWEEP_ORG = "00000000-0000-4000-8000-000000000000";
+const SWEEP_SECRET = "11111111-2222-4333-8444-555555555555";
+const KEY_A = "SCWEXAMPLEKEYAAAAAAA";
+const KEY_B = "SCWEXAMPLEKEYBBBBBBB";
+const KEY_ROGUE = "SCWEXAMPLEKEYROGUE01";
+
+/** A listing record shaped like Scaleway's, including a secret_key field. */
+function scwKey(
+  accessKey: string,
+  expiresAt: string | null,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    access_key: accessKey,
+    secret_key: null,
+    application_id: "aaaaaaaa-0000-4000-8000-000000000001",
+    user_id: null,
+    description: `key ${accessKey}`,
+    created_at: "2026-01-01T00:00:00Z",
+    expires_at: expiresAt,
+    ...extra,
+  };
+}
+
+/** Serve the listing in pages, honouring page and page_size, recording URLs. */
+function scwListing(all: Record<string, unknown>[], seen: string[] = []) {
+  return (url: string): Response => {
+    seen.push(url);
+    const u = new URL(url);
+    const page = Number(u.searchParams.get("page"));
+    const size = Number(u.searchParams.get("page_size"));
+    return new Response(
+      JSON.stringify({
+        api_keys: all.slice((page - 1) * size, page * size),
+        total_count: all.length,
+      }),
+      { status: 200 },
+    );
+  };
+}
+
+function sweepContext(
+  overrides: Record<string, unknown> = {},
+  credentials?: unknown[],
+) {
+  return createModelTestContext({
+    methodName: "sweep",
+    globalArgs: model.globalArguments.parse({
+      scwOrganizationId: SWEEP_ORG,
+      credentials: credentials ?? [
+        {
+          id: "scaleway/a",
+          kind: "scaleway-key",
+          secretRef: { vault: "store", key: "probe/secret" },
+          subject: KEY_A,
+        },
+        {
+          id: "scaleway/b",
+          kind: "scaleway-key",
+          secretRef: { vault: "store", key: "probe/secret" },
+          subject: KEY_B,
+        },
+        { id: "other/jwt", kind: "jwt", secret: jwt({ exp: 1 }) },
+      ],
+      ...overrides,
+    }),
+  });
+}
+
+async function runSweep(
+  handler: (url: string, init: RequestInit) => Response,
+  opts: {
+    overrides?: Record<string, unknown>;
+    credentials?: unknown[];
+    vaultItems?: Record<string, string>;
+    credentialId?: string;
+  } = {},
+) {
+  const ctx = sweepContext(opts.overrides, opts.credentials);
+  const redacted: string[] = [];
+  await withFetch(handler, () =>
+    model.methods.sweep.execute(
+      { credentialId: opts.credentialId },
+      {
+        ...ctx.context,
+        vaultService: fakeVault(
+          opts.vaultItems ?? { "store/probe/secret": SWEEP_SECRET },
+        ),
+        redactor: { addSecret: (v: string) => redacted.push(v) },
+      } as unknown as Parameters<typeof model.methods.sweep.execute>[1],
+    ));
+  const written = ctx.getWrittenResources();
+  assertEquals(written.length, 1);
+  assertEquals(written[0].name, SWEEP_INSTANCE);
+  return { sweep: written[0].data, redacted, written };
+}
+
+Deno.test("sweep: an org holding exactly the manifested, dated keys is ok and quiet", async () => {
+  const seen: string[] = [];
+  const { sweep, redacted } = await runSweep(
+    scwListing([
+      scwKey(KEY_A, "2027-09-01T00:00:00Z"),
+      scwKey(KEY_B, "2027-10-01T00:00:00Z"),
+    ], seen),
+  );
+  assertEquals(sweep.status, "ok");
+  assertEquals(sweep.total, 2);
+  assertEquals(sweep.manifested, 2);
+  assertEquals(sweep.unmanifested, []);
+  assertEquals(sweep.noExpiry, []);
+  assertEquals(sweep.notify, false);
+  assertEquals(sweep.notifyReason, "");
+  assertEquals(sweep.summary, "");
+  assertEquals(sweep.credentialId, "scaleway/a");
+  assertEquals(redacted, [SWEEP_SECRET]);
+  assertEquals(seen.length, 1);
+  const u = new URL(seen[0]);
+  assertEquals(u.pathname, "/iam/v1alpha1/api-keys");
+  assertEquals(u.searchParams.get("organization_id"), SWEEP_ORG);
+  assertEquals(u.searchParams.get("order_by"), "created_at_asc");
+});
+
+Deno.test("sweep: reports an unmanifested key and a key minted without an expiry", async () => {
+  const { sweep, written } = await runSweep(
+    scwListing([
+      scwKey(KEY_A, "2027-09-01T00:00:00Z"),
+      scwKey(KEY_B, null), // manifested, but never expires
+      scwKey(KEY_ROGUE, null, {
+        application_id: null,
+        user_id: "bbbbbbbb-0000-4000-8000-000000000002",
+        // Filled only on create; must never be copied anywhere.
+        secret_key: "99999999-8888-4777-8666-555555555555",
+      }),
+    ]),
+  );
+  assertEquals(sweep.status, "findings");
+  assertEquals(sweep.unmanifested, [KEY_ROGUE]);
+  assertEquals(sweep.noExpiry, [KEY_B, KEY_ROGUE]);
+  assertEquals(sweep.notify, true);
+  assertEquals(sweep.notifyReason, "unmanifested+noExpiry");
+  const lines = String(sweep.summary).split("\n");
+  assertEquals(lines.length, 2);
+  assertEquals(lines[0].startsWith(`NO-EXPIRY ${KEY_B} — application `), true);
+  assertEquals(
+    lines[1].startsWith(
+      `UNMANIFESTED NO-EXPIRY ${KEY_ROGUE} — user bbbbbbbb-0000-4000-8000-000000000002, never expires`,
+    ),
+    true,
+  );
+  const rogue = (sweep.keys as Array<Record<string, unknown>>).find((k) =>
+    k.accessKey === KEY_ROGUE
+  )!;
+  assertEquals(rogue.bearerType, "user");
+  assertEquals(rogue.manifested, false);
+  const blob = JSON.stringify(written);
+  assertEquals(blob.includes("99999999-8888"), false);
+  assertEquals(blob.includes(SWEEP_SECRET), false);
+  assertEquals(blob.includes("secret_key"), false);
+});
+
+Deno.test("sweep: an unmanifested key WITH an expiry is still a finding", async () => {
+  const { sweep } = await runSweep(
+    scwListing([
+      scwKey(KEY_A, "2027-09-01T00:00:00Z"),
+      scwKey(KEY_B, "2027-09-01T00:00:00Z"),
+      scwKey(KEY_ROGUE, "2027-09-01T00:00:00Z"),
+    ]),
+  );
+  assertEquals(sweep.status, "findings");
+  assertEquals(sweep.unmanifested, [KEY_ROGUE]);
+  assertEquals(sweep.noExpiry, []);
+  assertEquals(sweep.notifyReason, "unmanifested");
+});
+
+Deno.test("sweep: follows pagination to the last page", async () => {
+  const many = Array.from(
+    { length: SCW_PAGE_SIZE + 50 },
+    (_, i) =>
+      scwKey(
+        `SCWEXAMPLEPAGE${String(i).padStart(6, "0")}`,
+        "2027-09-01T00:00:00Z",
+      ),
+  );
+  many.push(scwKey(KEY_A, "2027-09-01T00:00:00Z"));
+  many.push(scwKey(KEY_B, "2027-09-01T00:00:00Z"));
+  const seen: string[] = [];
+  const { sweep } = await runSweep(scwListing(many, seen));
+  assertEquals(seen.map((u) => new URL(u).searchParams.get("page")), [
+    "1",
+    "2",
+  ]);
+  assertEquals(
+    new URL(seen[0]).searchParams.get("page_size"),
+    String(SCW_PAGE_SIZE),
+  );
+  assertEquals(sweep.total, SCW_PAGE_SIZE + 52);
+  assertEquals((sweep.unmanifested as string[]).length, SCW_PAGE_SIZE + 50);
+  assertEquals((sweep.unmanifested as string[]).includes(KEY_A), false);
+});
+
+Deno.test("sweep: a listing that ends short of total_count is unreachable, never complete", async () => {
+  const short = await runSweep((url) => {
+    const page = new URL(url).searchParams.get("page");
+    return new Response(
+      JSON.stringify({
+        api_keys: page === "1" ? [scwKey(KEY_A, "2027-09-01T00:00:00Z")] : [],
+        total_count: 2,
+      }),
+      { status: 200 },
+    );
+  });
+  assertEquals(short.sweep.status, "unreachable");
+  assertEquals(short.sweep.detail, "api-keys listing ended at 1 of 2 keys");
+  assertEquals(short.sweep.notify, true);
+  assertEquals(short.sweep.unmanifested, []);
+  assertEquals(short.sweep.total, null);
+});
+
+Deno.test("sweep: 401 is authFailed, and alerts", async () => {
+  const { sweep } = await runSweep(() => new Response("", { status: 401 }));
+  assertEquals(sweep.status, "authFailed");
+  assertEquals(sweep.notify, true);
+  assertEquals(sweep.notifyReason, "authFailed");
+  assertEquals(sweep.summary, "Scaleway refused the sweep secret (HTTP 401)");
+});
+
+Deno.test("sweep: 403 and 400 are misconfigured, and alert rather than pass blind", async () => {
+  for (const code of [403, 400]) {
+    const { sweep } = await runSweep(() => new Response("", { status: code }));
+    assertEquals(sweep.status, "misconfigured");
+    assertEquals(sweep.notify, true);
+    assertEquals(String(sweep.detail).includes(`HTTP ${code}`), true);
+  }
+});
+
+Deno.test("sweep: a 5xx or a malformed listing is unreachable", async () => {
+  const cases: Array<() => Response> = [
+    () => new Response("", { status: 503 }),
+    () => new Response("not json", { status: 200 }),
+    () => new Response(JSON.stringify({ api_keys: [] }), { status: 200 }),
+    () =>
+      new Response(
+        JSON.stringify({ api_keys: [{ access_key: "nope" }], total_count: 1 }),
+        { status: 200 },
+      ),
+    () =>
+      new Response(
+        JSON.stringify({
+          api_keys: [scwKey(KEY_A, "someday")],
+          total_count: 1,
+        }),
+        { status: 200 },
+      ),
+  ];
+  for (const handler of cases) {
+    const { sweep } = await runSweep(handler);
+    assertEquals(sweep.status, "unreachable");
+    assertEquals(sweep.notify, true);
+  }
+});
+
+Deno.test("sweep: no organization id is misconfigured, and nothing is fetched", async () => {
+  let calls = 0;
+  const { sweep } = await runSweep(() => {
+    calls += 1;
+    return new Response("", { status: 500 });
+  }, { overrides: { scwOrganizationId: "" } });
+  assertEquals(calls, 0);
+  assertEquals(sweep.status, "misconfigured");
+  assertEquals(String(sweep.detail).includes("scwOrganizationId"), true);
+});
+
+Deno.test("sweep: an unreadable secretRef is unresolved, not a thrown run", async () => {
+  let calls = 0;
+  const { sweep } = await runSweep(() => {
+    calls += 1;
+    return new Response("", { status: 500 });
+  }, { vaultItems: {} });
+  assertEquals(calls, 0);
+  assertEquals(sweep.status, "unresolved");
+  assertEquals(sweep.notify, true);
+  assertEquals(
+    String(sweep.detail).startsWith("could not read store/probe/secret"),
+    true,
+  );
+});
+
+Deno.test("pickSweepCredential infers only an unambiguous secret", () => {
+  const ref = (key: string) => ({ vault: "v", key });
+  const a = { id: "a", kind: "scaleway-key" as const, secretRef: ref("p") };
+  const b = { id: "b", kind: "scaleway-key" as const, secretRef: ref("p") };
+  const c = { id: "c", kind: "scaleway-key" as const, secretRef: ref("q") };
+  const j = { id: "j", kind: "jwt" as const, secret: "x" };
+  assertEquals(pickSweepCredential([j, a, b], undefined), a);
+  assertEquals(typeof pickSweepCredential([a, c], undefined), "string");
+  assertEquals(pickSweepCredential([a, c], "c"), c);
+  assertEquals(typeof pickSweepCredential([j], undefined), "string");
+  assertEquals(typeof pickSweepCredential([a, j], "j"), "string");
+  assertEquals(typeof pickSweepCredential([a], "missing"), "string");
+});
+
+Deno.test("sweep: an ambiguous secret with no credentialId is misconfigured", async () => {
+  const { sweep } = await runSweep(() => new Response("", { status: 500 }), {
+    credentials: [
+      {
+        id: "scaleway/a",
+        kind: "scaleway-key",
+        secretRef: { vault: "store", key: "probe/secret" },
+        subject: KEY_A,
+      },
+      {
+        id: "scaleway/b",
+        kind: "scaleway-key",
+        secretRef: { vault: "store", key: "other/secret" },
+        subject: KEY_B,
+      },
+    ],
+  });
+  assertEquals(sweep.status, "misconfigured");
+  assertEquals(String(sweep.detail).includes("credentialId"), true);
+});
+
+Deno.test("sweep: credentialId selects the entry to authenticate as", async () => {
+  const { sweep } = await runSweep(
+    scwListing([
+      scwKey(KEY_A, "2027-09-01T00:00:00Z"),
+      scwKey(KEY_B, "2027-09-01T00:00:00Z"),
+    ]),
+    { credentialId: "scaleway/b" },
+  );
+  assertEquals(sweep.status, "ok");
+  assertEquals(sweep.credentialId, "scaleway/b");
+});
+
+Deno.test("compareScalewayPlane sorts, flags, and leaves a clean plane empty", () => {
+  const got = compareScalewayPlane(
+    [
+      {
+        accessKey: KEY_B,
+        bearerType: "application",
+        bearerId: null,
+        description: "",
+        createdAt: null,
+        expiresAt: "2027-01-01T00:00:00.000Z",
+      },
+      {
+        accessKey: KEY_A,
+        bearerType: "application",
+        bearerId: null,
+        description: "",
+        createdAt: null,
+        expiresAt: "2027-01-01T00:00:00.000Z",
+      },
+    ],
+    new Set([KEY_A, KEY_B]),
+  );
+  assertEquals(got.keys.map((k) => k.accessKey), [KEY_A, KEY_B]);
+  assertEquals(got.unmanifested, []);
+  assertEquals(got.noExpiry, []);
+  assertEquals(got.summary, "");
+});
+
+Deno.test("listScalewayKeys refuses a malformed secret before any request", async () => {
+  let calls = 0;
+  const got = await withFetch(() => {
+    calls += 1;
+    return new Response("", { status: 200 });
+  }, () =>
+    listScalewayKeys("not-a-uuid", SWEEP_ORG, {
+      scwBaseUrl: "https://api.scaleway.com",
+      timeoutMs: 1000,
+    }));
+  assertEquals(calls, 0);
+  assertEquals("status" in got && got.status, "authFailed");
+});
+
+Deno.test("preflight reserves the sweep instance name", () => {
+  assertEquals(preflight([{ id: "sweep/scaleway" }]).length, 1);
+  assertEquals(preflight([{ id: "sweep-scaleway" }]).length, 1);
+});
+
+Deno.test("sweep: a record repeated across pages cannot stand in for a key never seen", async () => {
+  // Page 2 repeats page 1's key instead of the second key: a count of records
+  // would reach total_count, a count of distinct keys does not.
+  const { sweep } = await runSweep((url) => {
+    const page = new URL(url).searchParams.get("page");
+    return new Response(
+      JSON.stringify({
+        api_keys: page === "1" || page === "2"
+          ? [scwKey(KEY_A, "2027-09-01T00:00:00Z")]
+          : [],
+        total_count: 2,
+      }),
+      { status: 200 },
+    );
+  });
+  assertEquals(sweep.status, "unreachable");
+  assertEquals(sweep.detail, "api-keys listing ended at 1 of 2 keys");
 });
