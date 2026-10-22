@@ -13,7 +13,8 @@ healthy-looking registry.
 | --- | --- |
 | Model | `@sntxrr/credential-expiry` |
 | Probes | `jwt` (decode the `exp` claim), `github-pat` (GitHub's token-expiration response header), `gitlab-pat` (GitLab's token self-introspection endpoint), `pve-token` (Proxmox user record), `b2-key` (Backblaze key listing), `scaleway-key` (Scaleway IAM key record), `swamp-serve-token` (swamp serve's own token listing; no secret) |
-| Writes | `credential` per credential, `audit` summary as `current` |
+| Methods | `audit` probes each configured credential; `sweep` lists every Scaleway API key in an organization and reports keys missing from the model or minted without an expiry |
+| Writes | `credential` per credential, `audit` summary as `current`, `sweep` as `sweep-scaleway` |
 | Network | Read-only. Every probe is a decode or a `GET`. |
 
 ## Why the statuses are not collapsed

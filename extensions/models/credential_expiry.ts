@@ -49,7 +49,8 @@
  *
  * 5. **Read-only, by construction.** Every probe here is a decode, a GET, or
  *    (for `swamp-serve-token`) a `swamp access token list`, which reads token
- *    metadata and never a token's secret.
+ *    metadata and never a token's secret. The `sweep` method is a paginated GET
+ *    of a Scaleway organization's key listing.
  *    There is no method that can create, rotate or revoke anything, which is
  *    what makes it safe to run unattended on a schedule against production
  *    credentials. Rotation deliberately lives elsewhere — see
@@ -204,6 +205,11 @@ const GlobalArgsSchema = z.object({
     "Scaleway API base URL, for `scaleway-key` probes, without the /iam suffix. IAM is a " +
       "global (region-less) API, so the public default is right for every organization.",
   ),
+  scwOrganizationId: z.string().default("").describe(
+    "Scaleway organization id (a UUID), for the `sweep` method only. The IAM api-keys " +
+      "listing answers 400 without one, so a sweep with this unset reports `misconfigured` " +
+      "rather than listing nothing. Not a secret, and unused by `audit`.",
+  ),
   swampBin: z.string().min(1).default("swamp").describe(
     "The swamp CLI, for `swamp-serve-token` probes. Run as `swamp access token list --json`.",
   ),
@@ -261,6 +267,55 @@ const AuditSchema = z.object({
   /** Why `notifyToday` is set, for the notification subject line. */
   notifyReason: z.string(),
   /** One line per non-ok credential, ready to drop into a notification body. */
+  summary: z.string(),
+});
+
+/** Outcomes of a plane sweep, worst-first. */
+export const SWEEP_STATUSES = [
+  "authFailed",
+  "unresolved",
+  "misconfigured",
+  "unreachable",
+  "findings",
+  "ok",
+] as const;
+/** One of the sweep outcomes, narrowed from {@link SWEEP_STATUSES}. */
+export type SweepStatus = typeof SWEEP_STATUSES[number];
+
+const SweepKeySchema = z.object({
+  // An access key id is an identifier, not a secret: Scaleway prints it in its
+  // console and audit trail, and the secret half is never read or stored.
+  // swamp-quality-ignore credentials-sensitive-field
+  accessKey: z.string(),
+  bearerType: z.enum(["application", "user", "unknown"]),
+  bearerId: z.string().nullable(),
+  description: z.string(),
+  createdAt: z.string().nullable(),
+  expiresAt: z.string().nullable(),
+  manifested: z.boolean(),
+});
+
+const SweepSchema = z.object({
+  checkedAt: z.string(),
+  plane: z.literal("scaleway"),
+  status: z.enum(SWEEP_STATUSES),
+  /** Why the sweep could not list the plane; empty when it could. */
+  detail: z.string(),
+  /** The `scaleway-key` entry whose secret listed the organization. */
+  credentialId: z.string().nullable(),
+  /** Keys the organization holds; null when the listing failed. */
+  total: z.number().nullable(),
+  /** Distinct access key ids named by `scaleway-key` entries. */
+  manifested: z.number(),
+  /** Keys in the organization that no `scaleway-key` entry names. */
+  unmanifested: z.array(z.string()),
+  /** Keys in the organization with no expiry, manifested or not. */
+  noExpiry: z.array(z.string()),
+  keys: z.array(SweepKeySchema),
+  /** True when the sweep found something or could not run: see the method. */
+  notify: z.boolean(),
+  notifyReason: z.string(),
+  /** One line per finding, ready to drop into a notification body. */
   summary: z.string(),
 });
 
@@ -337,6 +392,13 @@ export function resourceNameFor(id: string): string {
 export const AUDIT_INSTANCE = "current";
 
 /**
+ * Instance name of the Scaleway plane sweep. Reserved like
+ * {@link AUDIT_INSTANCE}: `data.latest()` addresses an instance by name alone,
+ * so a credential normalising to it would be read in place of the sweep.
+ */
+export const SWEEP_INSTANCE = "sweep-scaleway";
+
+/**
  * Fail before probing anything, not halfway through.
  *
  * Two ids that differ but normalise to the same instance name would have the
@@ -358,11 +420,13 @@ export function preflight(
       problems.push(`id has no usable characters for a resource name: ${c.id}`);
       continue;
     }
-    if (name === AUDIT_INSTANCE) {
+    if (name === AUDIT_INSTANCE || name === SWEEP_INSTANCE) {
       // The summary is written under this name; a credential written there too
       // would be overwritten by it, and data.latest() would return the wrong shape.
       problems.push(
-        `id "${c.id}" normalises to "${AUDIT_INSTANCE}", which the audit summary uses`,
+        `id "${c.id}" normalises to "${name}", which the ${
+          name === AUDIT_INSTANCE ? "audit summary" : "Scaleway sweep"
+        } uses`,
       );
     }
     const clash = byName.get(name);
@@ -1311,6 +1375,267 @@ async function probeScalewayKey(
   return fromEpoch(ms / 1000, now, globalArgs);
 }
 
+// ---------------------------------------------------------------------------
+// Scaleway plane sweep
+// ---------------------------------------------------------------------------
+
+/** A Scaleway organization id: a UUID. */
+const SCW_ORG_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Page size for the api-keys listing; Scaleway's maximum. */
+export const SCW_PAGE_SIZE = 100;
+/**
+ * Hard stop on pagination. 100 pages of 100 is far past any real organization;
+ * a listing that has not ended by then is malformed, and reading it as complete
+ * would be a silent under-count.
+ */
+export const SCW_MAX_PAGES = 100;
+
+/** Longest key description carried into a resource. */
+const MAX_DESCRIPTION = 200;
+
+/** One API key from the listing, reduced to the fields a sweep reports. */
+export type ScalewayKeyRow = z.infer<typeof SweepKeySchema>;
+
+/**
+ * List every API key in a Scaleway organization, following pagination.
+ *
+ * Only the fields in {@link ScalewayKeyRow} survive: the listing's record type
+ * also has a `secret_key` field (filled only on create), and nothing outside the
+ * allow-list is ever copied, so a provider change cannot leak one into a
+ * resource. Status codes mirror {@link probeScalewayKey}, except 403 and 400:
+ * for a sweep both mean it cannot see the plane at all, which is
+ * `misconfigured`, not a quiet gap.
+ */
+export async function listScalewayKeys(
+  secret: string,
+  organizationId: string,
+  globalArgs: Pick<GlobalArgs, "scwBaseUrl" | "timeoutMs">,
+): Promise<
+  { keys: Array<Omit<ScalewayKeyRow, "manifested">> } | {
+    status: SweepStatus;
+    detail: string;
+  }
+> {
+  if (!SCW_SECRET_RE.test(secret)) {
+    return {
+      status: "authFailed",
+      detail: "secret is not a Scaleway secret key (a UUID)",
+    };
+  }
+  if (!SCW_ORG_RE.test(organizationId)) {
+    return {
+      status: "misconfigured",
+      detail: organizationId === ""
+        ? "`scwOrganizationId` is required for a sweep: the api-keys listing refuses a request without one"
+        : "`scwOrganizationId` is not a UUID",
+    };
+  }
+  const base = `${
+    globalArgs.scwBaseUrl.replace(/\/+$/, "")
+  }/iam/v1alpha1/api-keys`;
+  const keys: Array<Omit<ScalewayKeyRow, "manifested">> = [];
+  // A key minted mid-sweep can shift an offset page and repeat a record. Count
+  // each access key once, so a repeat cannot stand in for a key never seen:
+  // the total_count check below then reports the listing short.
+  const seen = new Set<string>();
+  for (let page = 1; page <= SCW_MAX_PAGES; page++) {
+    const url =
+      `${base}?organization_id=${encodeURIComponent(organizationId)}` +
+      `&page=${page}&page_size=${SCW_PAGE_SIZE}&order_by=created_at_asc`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { "X-Auth-Token": secret },
+        signal: AbortSignal.timeout(globalArgs.timeoutMs),
+      });
+    } catch (cause) {
+      return {
+        status: "unreachable",
+        detail: `request failed: ${String(cause)}`,
+      };
+    }
+    if (res.status === 401) {
+      await res.body?.cancel();
+      return {
+        status: "authFailed",
+        detail: "Scaleway refused the sweep secret (HTTP 401)",
+      };
+    }
+    if (res.status === 403) {
+      await res.body?.cancel();
+      return {
+        status: "misconfigured",
+        detail:
+          "sweep secret authenticates but cannot list API keys in this organization (HTTP 403): it needs IAM read at organization scope",
+      };
+    }
+    if (res.status === 400) {
+      await res.body?.cancel();
+      return {
+        status: "misconfigured",
+        detail:
+          "the api-keys listing rejected the request (HTTP 400): check `scwOrganizationId`",
+      };
+    }
+    if (!res.ok) {
+      await res.body?.cancel();
+      return {
+        status: "unreachable",
+        detail: `unexpected HTTP ${res.status} from the IAM api-keys listing`,
+      };
+    }
+    let body: { api_keys?: unknown; total_count?: unknown };
+    try {
+      body = await res.json();
+    } catch (cause) {
+      return {
+        status: "unreachable",
+        detail: `api-keys listing was not JSON: ${String(cause)}`,
+      };
+    }
+    if (!Array.isArray(body.api_keys) || typeof body.total_count !== "number") {
+      return {
+        status: "unreachable",
+        detail: "api-keys listing lacks api_keys[] or total_count",
+      };
+    }
+    for (const raw of body.api_keys as Array<Record<string, unknown>>) {
+      const accessKey = raw?.access_key;
+      if (typeof accessKey !== "string" || !SCW_ACCESS_KEY_RE.test(accessKey)) {
+        return {
+          status: "unreachable",
+          detail: "api-keys listing holds a record without a valid access_key",
+        };
+      }
+      if (seen.has(accessKey)) continue;
+      seen.add(accessKey);
+      const str = (v: unknown) => typeof v === "string" && v !== "" ? v : null;
+      const app = str(raw.application_id);
+      const user = str(raw.user_id);
+      const exp = raw.expires_at;
+      let expiresAt: string | null = null;
+      if (exp !== null && exp !== undefined && exp !== "") {
+        const ms = typeof exp === "string" ? Date.parse(exp) : NaN;
+        if (Number.isNaN(ms)) {
+          // Never read an unparseable expiry as "no expiry" or as a date.
+          return {
+            status: "unreachable",
+            detail: `expires_at of ${accessKey} is not an ISO 8601 timestamp`,
+          };
+        }
+        expiresAt = new Date(ms).toISOString();
+      }
+      const description = typeof raw.description === "string"
+        ? raw.description.replace(/\s+/g, " ").trim().slice(0, MAX_DESCRIPTION)
+        : "";
+      keys.push({
+        accessKey,
+        bearerType: app ? "application" : user ? "user" : "unknown",
+        bearerId: app ?? user,
+        description,
+        createdAt: str(raw.created_at),
+        expiresAt,
+      });
+    }
+    if (keys.length >= body.total_count || body.api_keys.length === 0) {
+      if (keys.length < body.total_count) {
+        return {
+          status: "unreachable",
+          detail:
+            `api-keys listing ended at ${keys.length} of ${body.total_count} keys`,
+        };
+      }
+      return { keys };
+    }
+  }
+  return {
+    status: "unreachable",
+    detail: `api-keys listing did not end within ${SCW_MAX_PAGES} pages`,
+  };
+}
+
+/**
+ * Choose the `scaleway-key` entry whose secret lists the organization.
+ *
+ * Named explicitly, or -- when omitted -- inferred only if every `scaleway-key`
+ * entry authenticates with the same secret, which is the normal shape (one
+ * read-only probe key reporting on several subjects). Anything ambiguous is
+ * refused rather than guessed.
+ */
+export function pickSweepCredential<
+  C extends {
+    id: string;
+    kind: ProbeKind;
+    secret?: string;
+    secretRef?: { vault: string; key: string };
+  },
+>(credentials: C[], credentialId: string | undefined): C | string {
+  const scw = credentials.filter((c) => c.kind === "scaleway-key");
+  if (credentialId) {
+    const named = credentials.find((c) => c.id === credentialId);
+    if (!named) return `no credential entry with id '${credentialId}'`;
+    if (named.kind !== "scaleway-key") {
+      return `credential '${credentialId}' is ${named.kind}, not scaleway-key`;
+    }
+    return named;
+  }
+  if (scw.length === 0) {
+    return "no scaleway-key entry to sweep with";
+  }
+  const sameAs = (c: C) =>
+    c.secretRef
+      ? `ref:${c.secretRef.vault}\u0000${c.secretRef.key}`
+      : `inline:${c.secret}`;
+  if (new Set(scw.map(sameAs)).size > 1) {
+    return "scaleway-key entries use different secrets: pass `credentialId` to name the one to sweep with";
+  }
+  return scw[0];
+}
+
+/**
+ * Compare a listing against the manifested subjects. Pure, so the decision of
+ * what to report is testable without a network.
+ */
+export function compareScalewayPlane(
+  keys: Array<Omit<ScalewayKeyRow, "manifested">>,
+  manifested: ReadonlySet<string>,
+): {
+  keys: ScalewayKeyRow[];
+  unmanifested: string[];
+  noExpiry: string[];
+  summary: string;
+} {
+  const rows = keys.map((k) => ({
+    ...k,
+    manifested: manifested.has(k.accessKey),
+  }))
+    .sort((a, b) => a.accessKey.localeCompare(b.accessKey));
+  const unmanifested = rows.filter((k) => !k.manifested).map((k) =>
+    k.accessKey
+  );
+  const noExpiry = rows.filter((k) => k.expiresAt === null).map((k) =>
+    k.accessKey
+  );
+  const lines: string[] = [];
+  for (const k of rows) {
+    const flags = [
+      ...(!k.manifested ? ["UNMANIFESTED"] : []),
+      ...(k.expiresAt === null ? ["NO-EXPIRY"] : []),
+    ];
+    if (flags.length === 0) continue;
+    const who = k.bearerId ? `${k.bearerType} ${k.bearerId}` : k.bearerType;
+    const exp = k.expiresAt ? `expires ${k.expiresAt}` : "never expires";
+    lines.push(
+      `${flags.join(" ")} ${k.accessKey} — ${who}, ${exp}${
+        k.description ? ` (${k.description})` : ""
+      }`,
+    );
+  }
+  return { keys: rows, unmanifested, noExpiry, summary: lines.join("\n") };
+}
+
 /**
  * One server token as `swamp access token list --json` describes it. Only these
  * fields are kept; the listing carries no secret, and anything else it grows is
@@ -1564,15 +1889,17 @@ export function probeFor(kind: ProbeKind): Probe {
 }
 
 /**
- * The credential-expiry model: a single read-only `audit` method that probes
- * every configured credential, writes one `credential` resource each plus an
- * `audit` summary, and refuses the whole run rather than report a partial one.
+ * The credential-expiry model. `audit` probes every configured credential,
+ * writes one `credential` resource each plus an `audit` summary, and refuses the
+ * whole run rather than report a partial one. `sweep` lists a Scaleway
+ * organization's keys and reports the ones the model does not name, and the
+ * ones with no expiry. Both are read-only.
  */
 export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.10.20.2",
+  version: "2026.10.22.1",
   // Purely additive: a fourth probe kind and the `pveBaseUrl` global argument
   // that serves it. No stored attribute changes shape, so the migration is a
   // no-op -- but it has to be DECLARED, or existing instances pin themselves to
@@ -1613,6 +1940,16 @@ export const model = {
         "Adds the `swamp-serve-token` probe kind and the `swampBin` / `swampRepoDir` global arguments. Nothing to migrate: the credential and audit resource schemas are unchanged. To monitor a swamp serve server token, add an entry with `kind: swamp-serve-token`, no `secret` or `secretRef`, and `subject` set to the token's name; the probe reads its expiresAt from `swamp access token list --json`, which carries no secret. Run the audit where the served repository is, and set `swampRepoDir` to it.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.10.22.1",
+      description:
+        "Adds the read-only `sweep` method, the `scwOrganizationId` global argument and the `sweep` resource. " +
+        "Nothing to migrate: `audit`, and the credential and audit resource schemas, are unchanged. " +
+        "The sweep lists every API key in a Scaleway organization and reports the keys no `scaleway-key` entry names (`unmanifested`) and the keys with no expiry (`noExpiry`), as instance `sweep-scaleway`. " +
+        "To use it, set `scwOrganizationId` and run `sweep`; it authenticates as a `scaleway-key` entry's secret (named by the `credentialId` argument, or inferred when every such entry shares one secret), which needs IAM read at organization scope. " +
+        "A credential id that normalises to `sweep-scaleway` is now refused by preflight, as `current` already was.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   globalArguments: GlobalArgsSchema,
   resources: {
@@ -1627,6 +1964,13 @@ export const model = {
       description:
         "Summary of one audit pass: counts by status, the soonest expiry, and whether anything needs a human",
       schema: AuditSchema,
+      lifetime: "infinite",
+      garbageCollection: 30,
+    },
+    "sweep": {
+      description:
+        "One sweep of a provider's whole key plane: keys missing from the manifest, and keys with no expiry",
+      schema: SweepSchema,
       lifetime: "infinite",
       garbageCollection: 30,
     },
@@ -1810,6 +2154,159 @@ export const model = {
         );
 
         return { dataHandles: handles };
+      },
+    },
+    sweep: {
+      description:
+        "List every API key in the Scaleway organization and report the ones no scaleway-key entry names, and the ones with no expiry",
+      arguments: z.object({
+        credentialId: z.string().optional().describe(
+          "Id of the `scaleway-key` entry whose secret lists the organization. Omit it " +
+            "when every `scaleway-key` entry shares one secret.",
+        ),
+      }),
+      // Every failure is a written resource with `notify: true`, never a throw:
+      // a sweep that cannot see the plane must say so through the same alert
+      // path as a finding, or a lapsed probe key would turn it back into the
+      // silence it exists to end.
+      execute: async (
+        args: { credentialId?: string },
+        context: {
+          globalArgs: GlobalArgs;
+          logger: Logger;
+          writeResource: (
+            specName: string,
+            name: string,
+            data: Record<string, unknown>,
+          ) => Promise<{ name: string }>;
+          vaultService?: VaultLike;
+          redactor?: { addSecret: (value: string) => void };
+        },
+      ) => {
+        const { globalArgs, logger } = context;
+        const checkedAt = new Date().toISOString();
+        const manifested = new Set(
+          globalArgs.credentials
+            .filter((c) => c.kind === "scaleway-key")
+            .map((c) => parseScalewaySubject(c.subject))
+            .filter((s): s is string => s !== null),
+        );
+
+        const write = async (
+          r: {
+            status: SweepStatus;
+            detail: string;
+            credentialId: string | null;
+            total: number | null;
+            unmanifested?: string[];
+            noExpiry?: string[];
+            keys?: ScalewayKeyRow[];
+            summary?: string;
+          },
+        ) => {
+          const unmanifested = r.unmanifested ?? [];
+          const noExpiry = r.noExpiry ?? [];
+          const reason = r.status === "findings"
+            ? [
+              ...(unmanifested.length ? ["unmanifested"] : []),
+              ...(noExpiry.length ? ["noExpiry"] : []),
+            ].join("+")
+            : r.status === "ok"
+            ? ""
+            : r.status;
+          logger.info("Scaleway sweep: {status} ({total} keys)", {
+            status: r.status,
+            total: r.total ?? "unknown",
+          });
+          return {
+            dataHandles: [
+              await context.writeResource("sweep", SWEEP_INSTANCE, {
+                checkedAt,
+                plane: "scaleway",
+                status: r.status,
+                detail: r.detail,
+                credentialId: r.credentialId,
+                total: r.total,
+                manifested: manifested.size,
+                unmanifested,
+                noExpiry,
+                keys: r.keys ?? [],
+                notify: r.status !== "ok",
+                notifyReason: reason,
+                summary: r.summary ?? (r.status === "ok" ? "" : r.detail),
+              }),
+            ],
+          };
+        };
+
+        const picked = pickSweepCredential(
+          globalArgs.credentials,
+          args.credentialId,
+        );
+        if (typeof picked === "string") {
+          return await write({
+            status: "misconfigured",
+            detail: picked,
+            credentialId: args.credentialId ?? null,
+            total: null,
+          });
+        }
+
+        // Checked before the vault read: a sweep that cannot list anything has
+        // no reason to read a secret.
+        if (!SCW_ORG_RE.test(globalArgs.scwOrganizationId)) {
+          return await write({
+            status: "misconfigured",
+            detail: globalArgs.scwOrganizationId === ""
+              ? "`scwOrganizationId` is required for a sweep: the api-keys listing refuses a request without one"
+              : "`scwOrganizationId` is not a UUID",
+            credentialId: picked.id,
+            total: null,
+          });
+        }
+
+        const resolved = await resolveSecret(
+          picked,
+          context.vaultService,
+          context.redactor,
+        );
+        if (!("secret" in resolved)) {
+          logger.warn("{id}: secret could not be read: {detail}", {
+            id: picked.id,
+            detail: resolved.detail,
+          });
+          return await write({
+            status: "unresolved",
+            detail: resolved.detail,
+            credentialId: picked.id,
+            total: null,
+          });
+        }
+
+        const listing = await listScalewayKeys(
+          resolved.secret,
+          globalArgs.scwOrganizationId,
+          globalArgs,
+        );
+        if (!("keys" in listing)) {
+          return await write({
+            status: listing.status,
+            detail: listing.detail,
+            credentialId: picked.id,
+            total: null,
+          });
+        }
+
+        const cmp = compareScalewayPlane(listing.keys, manifested);
+        return await write({
+          status: cmp.unmanifested.length + cmp.noExpiry.length > 0
+            ? "findings"
+            : "ok",
+          detail: "",
+          credentialId: picked.id,
+          total: listing.keys.length,
+          ...cmp,
+        });
       },
     },
   },
