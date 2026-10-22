@@ -2252,6 +2252,19 @@ export const model = {
           });
         }
 
+        // Checked before the vault read: a sweep that cannot list anything has
+        // no reason to read a secret.
+        if (!SCW_ORG_RE.test(globalArgs.scwOrganizationId)) {
+          return await write({
+            status: "misconfigured",
+            detail: globalArgs.scwOrganizationId === ""
+              ? "`scwOrganizationId` is required for a sweep: the api-keys listing refuses a request without one"
+              : "`scwOrganizationId` is not a UUID",
+            credentialId: picked.id,
+            total: null,
+          });
+        }
+
         const resolved = await resolveSecret(
           picked,
           context.vaultService,

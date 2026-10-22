@@ -1842,6 +1842,13 @@ Deno.test("sweep: no organization id is misconfigured, and nothing is fetched", 
   }, { overrides: { scwOrganizationId: "" } });
   assertEquals(calls, 0);
   assertEquals(sweep.status, "misconfigured");
+  const bad = await runSweep(() => new Response("", { status: 500 }), {
+    overrides: { scwOrganizationId: "not-an-org" },
+  });
+  assertEquals(bad.sweep.status, "misconfigured");
+  assertEquals(bad.sweep.detail, "`scwOrganizationId` is not a UUID");
+  // Nothing to list, so nothing to read: the vault is never asked.
+  assertEquals(bad.redacted, []);
   assertEquals(String(sweep.detail).includes("scwOrganizationId"), true);
 });
 
