@@ -208,6 +208,8 @@ Never inline a secret. Each entry takes exactly one of:
 - **`secretRef: {vault, key}`** (preferred for vault-held secrets). The method reads
   it per entry. A missing or unreadable item becomes that entry's `unresolved` status,
   and every other credential is still probed.
+- **`secretRef: {env}`**, an environment variable read the same way: unset or empty
+  is that entry's `unresolved` status, not a failed run.
 - **`secret`**, through `vault.get()` or `env`. The expression is resolved *before*
   the method runs, so one unresolvable `vault.get()` fails the whole audit and no
   credential is checked. Keep it for values that are not in a vault, such as an
@@ -216,6 +218,74 @@ Never inline a secret. Each entry takes exactly one of:
 Either way the value is never logged and never written to a resource. A value read
 through `secretRef` is registered with swamp's redactor as soon as it is read. Only
 the id, the expiry and the status leave the method.
+
+### Or read the list from a manifest
+
+If you already keep an inventory of credentials, point the model at it instead of
+keeping a second list. Set exactly one of `credentials` and `manifest`:
+
+```yaml
+globalArguments:
+  manifest:
+    path: inventory/credentials.yaml
+```
+
+`path` is relative to the repository root (swamp's `repoDir`, not the working
+directory). Absolute paths and `..` segments are refused. That check reads the path as
+text, so a symlink inside the repository is followed. The file has to be on the machine
+running the method, so manifest mode does not work on a remote worker, which has no
+checkout. The file is a mapping with a `credentials` list:
+
+```yaml
+credentials:
+  - id: connect-token/deploy-bot
+    monitor: true
+    probe: jwt
+    probe_source: {vault: store, key: deploy-bot/token}
+    holder: deploy runner environment
+    note: every scheduled deploy resolves its secrets through this
+  - id: token/from-the-environment
+    monitor: true
+    probe: jwt
+    probe_source: {env: BOOTSTRAP_TOKEN}
+  - id: serve/report-bot
+    monitor: true
+    probe: swamp-serve-token
+    probe_subject: report-bot
+  - id: token/nothing-can-read-this-yet
+    monitor: true
+  - id: token/deliberately-not-watched
+    monitor: false
+```
+
+| Manifest field | Becomes | |
+|---|---|---|
+| `monitor` | | Only `true` entries are read. |
+| `id` | `id` | |
+| `probe` | `kind` | No `probe`, or `asserted`, counts the entry as unprobed. |
+| `probe_source` | `secretRef` | `{vault, key}` or `{env}`. Absent for a secretless kind. |
+| `probe_subject` | `subject` | Required for `scaleway-key` and `swamp-serve-token`, refused for `jwt`, `github-pat` and `gitlab-pat`, which never read one. |
+| `note` | `note` | Shown in alerts, so say what breaks. Whitespace is flattened to one line. |
+| `holder` | `note` | Used only when the entry has no `note`. |
+
+Other fields are ignored. An entry with no `monitor` key is not watched and is not counted.
+
+**Unprobed entries** are watched by nothing, and the audit says so: it counts them in
+`unprobed`, lists them in `unprobedIds`, and adds one count-only line to `summary`. They
+get no `credential` resource and never make the audit notify.
+
+**A manifest the method cannot fully understand refuses the run**, because a monitor that
+silently drops an entry reads exactly like one that checked it. That covers an unreadable
+file; invalid YAML; no `credentials` list; a list item that is not a mapping; a monitored
+entry with no string `id`; a duplicate id or a resource-name clash among monitored
+entries; a non-boolean `monitor`; a `probe`, `probe_source` or `probe_subject` on an entry
+that is not monitored; `probe_source` or `probe_subject` with no `probe`; a misspelt
+field starting with `prob`; an
+unknown `probe`; `asserted` with a source or subject; a `probe_source` that is not exactly `{vault, key}` or `{env}`; a kind missing
+the secret or subject it needs; and a manifest with nothing to probe. An `audit` throws.
+A `sweep` writes its `misconfigured` resource and notifies, with one exception: a path or
+a both-or-neither mistake normally fails validation before the method runs, and swamp
+reports that as a failed run, currently worded only as `Invalid input at "manifest"`.
 
 ### Run an audit
 
@@ -306,6 +376,9 @@ The sweep authenticates as a `scaleway-key` entry's secret, which needs IAM read
 `scaleway-key` probes use. With no `credentialId` it uses that secret only when
 every `scaleway-key` entry shares it, and otherwise refuses to guess.
 
+With a manifest, only probed `scaleway-key` entries count as naming a key. A key that is
+in the manifest with no probe, or with `monitor: false`, is reported as `unmanifested`.
+
 The sweep never throws over the plane. Every outcome is written to the `sweep`
 resource, instance `sweep-scaleway`, with `status` set to one of `ok`,
 `findings`, `authFailed` (401 or a malformed secret), `unresolved` (the vault
@@ -335,7 +408,9 @@ the same name abort the run rather than silently overwrite one another.
 `audit` — written as instance `current`. Counts per status, `soonestDays` /
 `soonestId`, the `actionable` and `notifyToday` booleans, `notifyReason`, and a
 `summary` string of one line per non-ok credential, ready to drop into a
-notification body.
+notification body. `source` says where the list came from (`inline` or `manifest`), and
+`manifestPath` is the file actually read (null for an inline list). `unprobed` and
+`unprobedIds` count and name the monitored manifest entries with no probe.
 
 `sweep` — written as instance `sweep-scaleway` by the `sweep` method: `status`,
 `detail`, `total` keys in the organization, `manifested`, the `unmanifested` and

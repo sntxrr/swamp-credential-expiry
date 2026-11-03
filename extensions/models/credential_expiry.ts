@@ -47,7 +47,14 @@
  *    failure is reported as that entry's `unresolved` status -- the others are
  *    still probed.
  *
- * 5. **Read-only, by construction.** Every probe here is a decode, a GET, or
+ * 5. **One list.** The list of credentials can come from a manifest file
+ *    instead of the inline `credentials` argument, so a consumer that already
+ *    keeps an inventory does not keep a second copy of it to drift. See
+ *    {@link loadManifestCredentials}. A manifest the method cannot fully
+ *    understand refuses the run: a monitor that silently drops an entry reads
+ *    exactly like one that checked it.
+ *
+ * 6. **Read-only, by construction.** Every probe here is a decode, a GET, or
  *    (for `swamp-serve-token`) a `swamp access token list`, which reads token
  *    metadata and never a token's secret. The `sweep` method is a paginated GET
  *    of a Scaleway organization's key listing.
@@ -60,6 +67,7 @@
  */
 // extensions/models/credential_expiry.ts
 import { z } from "npm:zod@4";
+import { parse as parseYaml } from "jsr:@std/yaml@1.3.0";
 
 /** How a credential's expiry can be discovered. */
 export const PROBE_KINDS = [
@@ -103,14 +111,26 @@ export const STATUSES = [
 /** One of the reportable outcomes, narrowed from {@link STATUSES}. */
 export type Status = typeof STATUSES[number];
 
-const SecretRefSchema = z.object({
-  vault: z.string().min(1).describe(
-    "Name of the swamp vault holding the secret.",
-  ),
-  key: z.string().min(1).describe(
-    "Key within that vault, exactly as vault.get() would take it, e.g. item/field.",
-  ),
-});
+// Strict on purpose: a non-strict union strips the unknown key, so an entry
+// setting both a vault and an env name would quietly lose one of them.
+const SecretRefSchema = z.union([
+  z.strictObject({
+    vault: z.string().min(1).describe(
+      "Name of the swamp vault holding the secret.",
+    ),
+    key: z.string().min(1).describe(
+      "Key within that vault, exactly as vault.get() would take it, e.g. item/field.",
+    ),
+  }),
+  z.strictObject({
+    env: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).describe(
+      "Name of the environment variable holding the secret, read by the method.",
+    ),
+  }),
+]);
+
+/** Where an entry's secret is read from: a vault item, or an environment variable. */
+export type SecretRef = z.infer<typeof SecretRefSchema>;
 
 const CredentialInputSchema = z.object({
   id: z.string().min(1).describe(
@@ -134,7 +154,7 @@ const CredentialInputSchema = z.object({
       "Prefer `secretRef` for vault-held secrets: an inline vault.get() that cannot be resolved fails the whole audit before any credential is probed.",
   ).meta({ sensitive: true }),
   secretRef: SecretRefSchema.optional().describe(
-    "Where to read the credential from, resolved by the method itself, per entry. " +
+    "Where to read the credential from, `{vault, key}` or `{env}`, resolved by the method itself, per entry. " +
       "A secret that cannot be read is reported as this entry's `unresolved` status " +
       "instead of failing the run. Set exactly one of `secret` and `secretRef`.",
   ),
@@ -172,8 +192,15 @@ const CredentialInputSchema = z.object({
 });
 
 const GlobalArgsSchema = z.object({
-  credentials: z.array(CredentialInputSchema).min(1).describe(
-    "The credentials to probe.",
+  credentials: z.array(CredentialInputSchema).min(1).optional().describe(
+    "The credentials to probe. Set exactly one of `credentials` and `manifest`.",
+  ),
+  manifest: z.strictObject({
+    path: z.string().min(1).describe(
+      "Path of the YAML manifest, relative to the repository root. Absolute paths and `..` segments are refused.",
+    ),
+  }).optional().describe(
+    "Read the credentials to probe from a YAML manifest instead. See `loadManifestCredentials` for its shape. Set exactly one of `credentials` and `manifest`.",
   ),
   warnDays: z.array(z.number().int().positive()).default([30, 14, 7]).describe(
     "Day thresholds at which a credential is reported `warn`. The largest is the point at which it first becomes visible.",
@@ -221,6 +248,12 @@ const GlobalArgsSchema = z.object({
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Abort any single probe request after this long.",
   ),
+}).superRefine((args, ctx) => {
+  // Pathed because swamp's CLI prints "Invalid input" in place of a custom
+  // message, and the path is then all that points at the mistake.
+  for (const message of credentialSourceProblems(args)) {
+    ctx.addIssue({ code: "custom", message, path: ["manifest"] });
+  }
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -235,6 +268,33 @@ const CredentialSchema = z.object({
   detail: z.string(),
   checkedAt: z.string(),
 });
+
+/**
+ * The rules for where the list comes from. Called from the schema AND when the
+ * list is resolved, because swamp skips object refinements while any global
+ * argument still holds an unresolved expression, so the schema alone is not a
+ * guarantee.
+ */
+export function credentialSourceProblems(
+  args: { credentials?: unknown; manifest?: { path: string } },
+): string[] {
+  if ((args.credentials === undefined) === (args.manifest === undefined)) {
+    return ["set exactly one of `credentials` and `manifest`"];
+  }
+  if (args.manifest === undefined) return [];
+  const { path } = args.manifest;
+  if (/^([/\\]|[A-Za-z]:)/.test(path)) {
+    return ["`manifest.path` must be relative to the repository root"];
+  }
+  const segments = path.split(/[/\\]/);
+  if (segments.includes("..")) {
+    return ["`manifest.path` must not contain a `..` segment"];
+  }
+  if (segments.every((s) => s === "" || s === ".")) {
+    return ["`manifest.path` names no file"];
+  }
+  return [];
+}
 
 const AuditSchema = z.object({
   checkedAt: z.string(),
@@ -266,8 +326,19 @@ const AuditSchema = z.object({
   notifyToday: z.boolean(),
   /** Why `notifyToday` is set, for the notification subject line. */
   notifyReason: z.string(),
-  /** One line per non-ok credential, ready to drop into a notification body. */
+  /**
+   * One line per non-ok credential, ready to drop into a notification body,
+   * plus one count-only line when monitored entries have no probe.
+   */
   summary: z.string(),
+  /** Where the list came from. */
+  source: z.enum(["inline", "manifest"]).default("inline"),
+  /** Monitored manifest entries with no probe. Counted, never alerted on. */
+  unprobed: z.number().default(0),
+  /** Their ids. Kept out of `summary` so they cannot bury the actionable lines. */
+  unprobedIds: z.array(z.string()).default([]),
+  /** The manifest actually read, as an absolute path; null for an inline list. */
+  manifestPath: z.string().nullable().default(null),
 });
 
 /** Outcomes of a plane sweep, worst-first. */
@@ -321,7 +392,8 @@ const SweepSchema = z.object({
 
 /**
  * The subset of swamp's structured logger this model uses. Declared locally
- * rather than imported so the module stays dependency-free apart from zod.
+ * rather than imported, to keep the module's dependencies to zod and the YAML
+ * parser.
  */
 export type Logger = {
   info: (msg: string, fields?: Record<string, unknown>) => void;
@@ -480,6 +552,15 @@ export type VaultLike = {
 const MAX_UNRESOLVED_DETAIL = 300;
 
 /**
+ * The method's own reads from outside. Overridable so tests need no file or
+ * environment permissions.
+ */
+export const ioDeps = {
+  readTextFile: (path: string): Promise<string> => Deno.readTextFile(path),
+  getEnv: (name: string): string | undefined => Deno.env.get(name),
+};
+
+/**
  * Get one entry's secret, or say why it could not be read.
  *
  * Never throws: a failure here is the entry's finding, not the run's. The
@@ -489,13 +570,24 @@ const MAX_UNRESOLVED_DETAIL = 300;
  * log it.
  */
 export async function resolveSecret(
-  cred: { secret?: string; secretRef?: { vault: string; key: string } },
+  cred: { secret?: string; secretRef?: SecretRef },
   vault: VaultLike | undefined,
   redactor?: { addSecret: (value: string) => void },
 ): Promise<{ secret: string } | { detail: string }> {
   if (cred.secret !== undefined) return { secret: cred.secret };
   const ref = cred.secretRef;
   if (!ref) return { detail: "entry has neither secret nor secretRef" };
+  if ("env" in ref) {
+    let fromEnv: string | undefined;
+    try {
+      fromEnv = ioDeps.getEnv(ref.env);
+    } catch {
+      return { detail: `env ${ref.env} could not be read` };
+    }
+    if (!fromEnv) return { detail: `env ${ref.env} is unset or empty` };
+    redactor?.addSecret(fromEnv);
+    return { secret: fromEnv };
+  }
   const where = `${ref.vault}/${ref.key}`;
   if (!vault) {
     return { detail: `no vault service available to read ${where}` };
@@ -523,6 +615,265 @@ export async function resolveSecret(
   }
   redactor?.addSecret(value);
   return { secret: value };
+}
+
+/** Kinds that report on the entry's `subject` and cannot run without one. */
+const SUBJECT_REQUIRED_KINDS: ReadonlySet<string> = new Set<ProbeKind>([
+  "scaleway-key",
+  "swamp-serve-token",
+]);
+
+/** Kinds that never read a `subject`: setting one would silently do nothing. */
+const SUBJECT_UNUSED_KINDS: ReadonlySet<string> = new Set<ProbeKind>([
+  "jwt",
+  "github-pat",
+  "gitlab-pat",
+]);
+
+/** The only manifest field names that may start with `prob`. */
+const PROBE_FIELDS: ReadonlySet<string> = new Set([
+  "probe",
+  "probe_source",
+  "probe_subject",
+]);
+
+/** A credential entry as validated, whichever list it came from. */
+export type CredentialInput = z.infer<typeof CredentialInputSchema>;
+
+/**
+ * The manifest's line number, from a parse error's text. The rest of that text
+ * quotes the source line, which must never leave this function, so only digits
+ * are captured.
+ */
+export function yamlErrorLine(e: unknown): string {
+  const m = e instanceof Error
+    ? / at line (\d+), column \d+:/.exec(e.message)
+    : null;
+  return m ? `line ${m[1]}` : "line unknown";
+}
+
+/**
+ * Read the credential list out of a manifest's text. Pure.
+ *
+ * A manifest is a mapping with a `credentials` list. Of each entry, this reads:
+ *
+ * - `monitor`: only `true` entries are taken.
+ * - `id`: the credential's stable id.
+ * - `probe`: the probe kind. No probe, or `asserted` (reserved for a date-only
+ *   probe), means the entry is counted as unprobed.
+ * - `probe_source`: `{vault, key}` or `{env}`, absent for a secretless kind.
+ * - `probe_subject`: the entry's `subject`.
+ * - `note`: the entry's `note`, shown in alerts: say what breaks.
+ * - `holder`: the entry's `note` when it has no `note` of its own.
+ *
+ * Other fields are ignored. Anything the method cannot fully understand is a
+ * problem, and any problem refuses the run: a monitor that silently drops an
+ * entry is indistinguishable from one that checked it. Problems name ids and
+ * positions, never field values.
+ */
+export function loadManifestCredentials(text: string): {
+  credentials: CredentialInput[];
+  unprobedIds: string[];
+  problems: string[];
+} {
+  const credentials: CredentialInput[] = [];
+  const unprobedIds: string[] = [];
+  const problems: string[] = [];
+  const refuse = (p: string) => ({
+    credentials: [],
+    unprobedIds: [],
+    problems: [p],
+  });
+
+  let doc: unknown;
+  try {
+    doc = parseYaml(text);
+  } catch (e) {
+    return refuse(`manifest is not valid YAML (${yamlErrorLine(e)})`);
+  }
+  const list = doc !== null && typeof doc === "object"
+    ? (doc as Record<string, unknown>).credentials
+    : undefined;
+  if (!Array.isArray(list)) {
+    return refuse("manifest has no top-level `credentials` list");
+  }
+
+  const monitoredIds: Array<{ id: string }> = [];
+  list.forEach((item: unknown, i: number) => {
+    // By prototype, because YAML also parses to objects that are not mappings:
+    // a date item is a Date, and a !!binary item a byte array.
+    const proto = item !== null && typeof item === "object"
+      ? Object.getPrototypeOf(item)
+      : undefined;
+    if (proto !== Object.prototype && proto !== null) {
+      problems.push(`credentials[${i}] is not a mapping`);
+      return;
+    }
+    const e = item as Record<string, unknown>;
+    const label = typeof e.id === "string" && e.id !== ""
+      ? e.id
+      : `credentials[${i}]`;
+    const hasProbe = e.probe !== undefined && e.probe !== null;
+    const hasDetail =
+      (e.probe_source !== undefined && e.probe_source !== null) ||
+      (e.probe_subject !== undefined && e.probe_subject !== null);
+
+    if (e.monitor !== undefined && typeof e.monitor !== "boolean") {
+      problems.push(`\`monitor\` is not a boolean on ${label}`);
+      return;
+    }
+    if (e.monitor !== true) {
+      if (hasProbe || hasDetail) {
+        problems.push(`probe set but monitor is not true on ${label}`);
+      }
+      return;
+    }
+    if (typeof e.id !== "string" || e.id === "") {
+      problems.push(`${label} is monitored but has no string id`);
+      return;
+    }
+    monitoredIds.push({ id: e.id });
+
+    // A misspelt field must not quietly change what is checked: `prob` would
+    // read as unprobed, and `probe_subjct` would make a reader token report on
+    // itself under the watched id, which can read ok while the real one lapses.
+    // The field's name is not repeated, in case a value was pasted as a key.
+    if (Object.keys(e).some((k) => /^prob/i.test(k) && !PROBE_FIELDS.has(k))) {
+      problems.push(`misspelt probe field on ${e.id}`);
+      return;
+    }
+
+    if (!hasProbe) {
+      if (hasDetail) {
+        problems.push(`probe_source/probe_subject without probe on ${e.id}`);
+      } else {
+        unprobedIds.push(e.id);
+      }
+      return;
+    }
+    if (e.probe === "asserted") {
+      if (hasDetail) {
+        problems.push(
+          `asserted takes no probe_source/probe_subject on ${e.id}`,
+        );
+      } else {
+        unprobedIds.push(e.id);
+      }
+      return;
+    }
+    if (
+      typeof e.probe !== "string" ||
+      !(PROBE_KINDS as readonly string[]).includes(e.probe)
+    ) {
+      problems.push(`unknown probe on ${e.id}`);
+      return;
+    }
+    if (
+      SUBJECT_REQUIRED_KINDS.has(e.probe) &&
+      (e.probe_subject === undefined || e.probe_subject === null ||
+        e.probe_subject === "")
+    ) {
+      problems.push(`${e.probe} entry ${e.id} has no probe_subject`);
+      return;
+    }
+    if (
+      SUBJECT_UNUSED_KINDS.has(e.probe) &&
+      e.probe_subject !== undefined && e.probe_subject !== null
+    ) {
+      problems.push(`${e.probe} takes no probe_subject on ${e.id}`);
+      return;
+    }
+
+    // A location is a poor alert, so an entry can say what breaks instead.
+    const note = e.note ?? e.holder ?? "";
+    const candidate: Record<string, unknown> = {
+      id: e.id,
+      kind: e.probe,
+      subject: e.probe_subject ?? "",
+      // Flattened: a summary is documented as one line per credential.
+      note: typeof note === "string" ? note.replace(/\s+/g, " ").trim() : note,
+    };
+    // An absent source is not a problem here: the schema's own rule decides,
+    // so a secretless kind passes and a kind that needs a secret is refused.
+    if (e.probe_source !== undefined && e.probe_source !== null) {
+      candidate.secretRef = e.probe_source;
+    }
+    const parsed = CredentialInputSchema.safeParse(candidate);
+    if (!parsed.success) {
+      for (const issue of parsed.error.issues) {
+        // No message for a secretRef: zod's "Unrecognized key" repeats the key,
+        // and a value pasted as a key would reach the alert body.
+        if (issue.path[0] === "secretRef") {
+          problems.push(`invalid secretRef on ${e.id}`);
+          continue;
+        }
+        const field = issue.path.join(".") || "entry";
+        problems.push(`invalid ${field} on ${e.id}: ${issue.message}`);
+      }
+      return;
+    }
+    credentials.push(parsed.data);
+  });
+
+  // Over every monitored id, not just the probed ones, or a duplicate among
+  // unprobed entries would pass and leave the count wrong.
+  problems.push(...preflight(monitoredIds));
+  if (problems.length === 0 && credentials.length === 0) {
+    problems.push("manifest has no entry that can be probed");
+  }
+  return problems.length > 0
+    ? { credentials: [], unprobedIds: [], problems }
+    : { credentials, unprobedIds, problems };
+}
+
+/** A resolved list of credentials to probe, and where it came from. */
+export type ResolvedCredentials = {
+  credentials: CredentialInput[];
+  unprobedIds: string[];
+  source: "inline" | "manifest";
+  manifestPath: string | null;
+};
+
+/** Join the repository root and a checked relative path, dropping `.` segments. */
+export function manifestPathFor(repoDir: string, path: string): string {
+  const segments = path.split(/[/\\]/).filter((s) => s !== "" && s !== ".");
+  return [repoDir.replace(/[/\\]+$/, ""), ...segments].join("/");
+}
+
+/**
+ * Work out what to probe. Never throws: the caller decides what a problem means,
+ * because the audit refuses the run and the sweep reports through its resource.
+ */
+export async function resolveCredentials(
+  args: { credentials?: CredentialInput[]; manifest?: { path: string } },
+  repoDir: string,
+): Promise<ResolvedCredentials | { problems: string[] }> {
+  const problems = credentialSourceProblems(args);
+  if (problems.length > 0) return { problems };
+  if (args.manifest === undefined) {
+    return {
+      credentials: args.credentials ?? [],
+      unprobedIds: [],
+      source: "inline",
+      manifestPath: null,
+    };
+  }
+  const manifestPath = manifestPathFor(repoDir, args.manifest.path);
+  let text: string;
+  try {
+    text = await ioDeps.readTextFile(manifestPath);
+  } catch (e) {
+    const why = e instanceof Error ? e.name : "error";
+    return { problems: [`could not read manifest ${manifestPath}: ${why}`] };
+  }
+  const loaded = loadManifestCredentials(text);
+  if (loaded.problems.length > 0) return { problems: loaded.problems };
+  return {
+    credentials: loaded.credentials,
+    unprobedIds: loaded.unprobedIds,
+    source: "manifest",
+    manifestPath,
+  };
 }
 
 /** Map days-remaining onto a status, given the configured thresholds. */
@@ -1569,7 +1920,7 @@ export function pickSweepCredential<
     id: string;
     kind: ProbeKind;
     secret?: string;
-    secretRef?: { vault: string; key: string };
+    secretRef?: SecretRef;
   },
 >(credentials: C[], credentialId: string | undefined): C | string {
   const scw = credentials.filter((c) => c.kind === "scaleway-key");
@@ -1585,9 +1936,11 @@ export function pickSweepCredential<
     return "no scaleway-key entry to sweep with";
   }
   const sameAs = (c: C) =>
-    c.secretRef
-      ? `ref:${c.secretRef.vault}\u0000${c.secretRef.key}`
-      : `inline:${c.secret}`;
+    !c.secretRef
+      ? `inline:${c.secret}`
+      : "env" in c.secretRef
+      ? `env:${c.secretRef.env}`
+      : `ref:${c.secretRef.vault}\u0000${c.secretRef.key}`;
   if (new Set(scw.map(sameAs)).size > 1) {
     return "scaleway-key entries use different secrets: pass `credentialId` to name the one to sweep with";
   }
@@ -1899,7 +2252,7 @@ export const model = {
   type: "@sntxrr/credential-expiry",
   description:
     "Probe the credentials a fleet actually holds and report how long each has left, distinguishing expiry from an outage in progress",
-  version: "2026.10.22.1",
+  version: "2026.11.03.1",
   // Purely additive: a fourth probe kind and the `pveBaseUrl` global argument
   // that serves it. No stored attribute changes shape, so the migration is a
   // no-op -- but it has to be DECLARED, or existing instances pin themselves to
@@ -1950,6 +2303,15 @@ export const model = {
         "A credential id that normalises to `sweep-scaleway` is now refused by preflight, as `current` already was.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.11.03.1",
+      description:
+        "Adds the `manifest: {path}` global argument, an alternative to `credentials` (set exactly one), which reads the list from a YAML manifest. " +
+        "Adds `secretRef: {env}`, read from the method's environment and per entry like a vault reference. " +
+        "Adds four audit fields: `source`, `unprobed`, `unprobedIds` and `manifestPath`; audit resources written before this version take their defaults. " +
+        "Nothing to migrate: an inline `credentials` list behaves as before, with one exception: a `secretRef` carrying an extra key is now refused rather than having that key silently stripped.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   globalArguments: GlobalArgsSchema,
   resources: {
@@ -1990,14 +2352,21 @@ export const model = {
             name: string,
             data: Record<string, unknown>,
           ) => Promise<{ name: string }>;
+          repoDir: string;
           vaultService?: VaultLike;
           redactor?: { addSecret: (value: string) => void };
         },
       ) => {
         const { globalArgs, logger } = context;
 
-        const problems = preflight(globalArgs.credentials);
-        if (problems.length > 0) {
+        const resolvedList = await resolveCredentials(
+          globalArgs,
+          context.repoDir,
+        );
+        const problems = "problems" in resolvedList
+          ? resolvedList.problems
+          : preflight(resolvedList.credentials);
+        if ("problems" in resolvedList || problems.length > 0) {
           // Refuse the whole run. A partial audit that still reports success is
           // worse than no audit -- it is the shape of every silent under-count.
           throw new Error(
@@ -2007,8 +2376,11 @@ export const model = {
           );
         }
 
-        logger.info("Auditing {total} credentials", {
-          total: globalArgs.credentials.length,
+        const { credentials, unprobedIds, source, manifestPath } = resolvedList;
+
+        logger.info("Auditing {total} credentials ({unprobed} unprobed)", {
+          total: credentials.length,
+          unprobed: unprobedIds.length,
         });
 
         const now = new Date();
@@ -2037,7 +2409,7 @@ export const model = {
           serveTokens: () => serveTokens ??= readServeTokenList(globalArgs),
         };
 
-        for (const cred of globalArgs.credentials) {
+        for (const cred of credentials) {
           // A switch rather than a ternary chain: the compiler now fails the
           // build if a probe kind is added to PROBE_KINDS without a probe
           // behind it, instead of quietly routing it to whichever branch
@@ -2132,17 +2504,25 @@ export const model = {
         logger.info(
           "{total} credentials probed; {actionable}",
           {
-            total: globalArgs.credentials.length,
+            total: credentials.length,
             actionable: actionable ? "action needed" : "all clear",
           },
         );
 
         const { notify, reason } = shouldNotify(outcomes, globalArgs);
 
+        // A count, not the ids: there can be many, and a body is read for its
+        // actionable lines. This does not make anything notify.
+        if (unprobedIds.length > 0) {
+          lines.push(
+            `UNPROBED ${unprobedIds.length} monitored entries have no probe`,
+          );
+        }
+
         handles.push(
           await context.writeResource("audit", AUDIT_INSTANCE, {
             checkedAt,
-            total: globalArgs.credentials.length,
+            total: credentials.length,
             ...counts,
             soonestDays,
             soonestId,
@@ -2150,6 +2530,10 @@ export const model = {
             notifyToday: notify,
             notifyReason: reason,
             summary: lines.join("\n"),
+            source,
+            unprobed: unprobedIds.length,
+            unprobedIds,
+            manifestPath,
           }),
         );
 
@@ -2179,14 +2563,24 @@ export const model = {
             name: string,
             data: Record<string, unknown>,
           ) => Promise<{ name: string }>;
+          repoDir: string;
           vaultService?: VaultLike;
           redactor?: { addSecret: (value: string) => void };
         },
       ) => {
         const { globalArgs, logger } = context;
         const checkedAt = new Date().toISOString();
+        const resolvedList = await resolveCredentials(
+          globalArgs,
+          context.repoDir,
+        );
+        // A failed resolve leaves an empty list, so the misconfigured write
+        // below has a `manifested` to read.
+        const credentials = "problems" in resolvedList
+          ? []
+          : resolvedList.credentials;
         const manifested = new Set(
-          globalArgs.credentials
+          credentials
             .filter((c) => c.kind === "scaleway-key")
             .map((c) => parseScalewaySubject(c.subject))
             .filter((s): s is string => s !== null),
@@ -2239,10 +2633,20 @@ export const model = {
           };
         };
 
-        const picked = pickSweepCredential(
-          globalArgs.credentials,
-          args.credentialId,
-        );
+        if ("problems" in resolvedList) {
+          const shown = resolvedList.problems.slice(0, 10);
+          const more = resolvedList.problems.length - shown.length;
+          return await write({
+            status: "misconfigured",
+            detail: `credential-expiry configuration is invalid: ${
+              shown.join("; ")
+            }${more > 0 ? ` (and ${more} more)` : ""}`,
+            credentialId: args.credentialId ?? null,
+            total: null,
+          });
+        }
+
+        const picked = pickSweepCredential(credentials, args.credentialId);
         if (typeof picked === "string") {
           return await write({
             status: "misconfigured",
