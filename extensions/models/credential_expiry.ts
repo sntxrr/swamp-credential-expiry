@@ -113,6 +113,7 @@ export type Status = typeof STATUSES[number];
 
 // Strict on purpose: a non-strict union strips the unknown key, so an entry
 // setting both a vault and an env name would quietly lose one of them.
+// swamp-quality-ignore credentials-sensitive-field
 const SecretRefSchema = z.union([
   z.strictObject({
     vault: z.string().min(1).describe(
