@@ -72,10 +72,15 @@ globalArguments:
   criticalDays: 3
 ```
 
-Never inline a secret: use `secretRef: {vault, key}` or `secret: '${{ vault.get(...) }}'`.
+Never inline a secret: use `secretRef: {vault, key}`, `secretRef: {env}` or
+`secret: '${{ vault.get(...) }}'`.
 A `secretRef` is read per entry, so a missing vault item is reported as that entry's
 `unresolved` status rather than failing the whole audit. Either way the value is never
 logged and never reaches a resource. Only the id, the expiry and the status leave the method.
+
+Already keep an inventory? Set `manifest: {path: inventory/credentials.yaml}` instead of
+`credentials`, and the list is read from that file, relative to the repository root. See
+[the model README](extensions/models/README.md#or-read-the-list-from-a-manifest).
 
 ## Development
 

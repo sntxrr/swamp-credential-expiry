@@ -6,8 +6,12 @@ import {
   classify,
   type CommandRunner,
   compareScalewayPlane,
+  credentialSourceProblems,
   decodeJwtExp,
+  ioDeps,
   listScalewayKeys,
+  loadManifestCredentials,
+  manifestPathFor,
   model,
   parseB2Secret,
   parseB2Subject,
@@ -24,6 +28,7 @@ import {
   SCW_PAGE_SIZE,
   SWEEP_INSTANCE,
   type VaultLike,
+  yamlErrorLine,
 } from "./credential_expiry.ts";
 
 /** Build an unsigned-but-well-formed JWT with the given payload. */
@@ -1279,8 +1284,12 @@ Deno.test("secret stays marked sensitive through .optional()", () => {
   // Each zod wrapper carries its own metadata. Marking only the inner string
   // left the field's outer schema without the flag (caught in review).
   const cred = (model.globalArguments.shape.credentials as unknown as {
-    element: { shape: Record<string, { meta: () => Record<string, unknown> }> };
-  }).element;
+    unwrap: () => {
+      element: {
+        shape: Record<string, { meta: () => Record<string, unknown> }>;
+      };
+    };
+  }).unwrap().element;
   assertEquals(cred.shape.secret.meta()?.sensitive, true);
 });
 
@@ -1978,4 +1987,883 @@ Deno.test("sweep: a record repeated across pages cannot stand in for a key never
   });
   assertEquals(sweep.status, "unreachable");
   assertEquals(sweep.detail, "api-keys listing ended at 1 of 2 keys");
+});
+
+// ---------------------------------------------------------------------------
+// Credential list from a manifest
+// ---------------------------------------------------------------------------
+
+const MANIFEST_FUTURE = Math.floor(Date.now() / 1000) + 200 * 86_400;
+
+/** Run `fn` with the file read and the environment faked. */
+async function withIo<T>(
+  io: { files?: Record<string, string>; env?: Record<string, string> },
+  fn: () => T | Promise<T>,
+): Promise<T> {
+  const original = { ...ioDeps };
+  ioDeps.readTextFile = (path: string) => {
+    const text = io.files?.[path];
+    return text === undefined
+      ? Promise.reject(new Deno.errors.NotFound(`no such file ${path}`))
+      : Promise.resolve(text);
+  };
+  ioDeps.getEnv = (name: string) => io.env?.[name];
+  try {
+    return await fn();
+  } finally {
+    Object.assign(ioDeps, original);
+  }
+}
+
+const MANIFEST_FIXTURE = `
+credentials:
+  - id: connect-token/example-a
+    monitor: true
+    probe: jwt
+    probe_source: {env: EXAMPLE_TOKEN_A}
+    holder: example job a
+  - id: connect-token/example-b
+    monitor: true
+    probe: jwt
+    probe_source: {env: EXAMPLE_TOKEN_B}
+  - id: example/no-probe
+    monitor: true
+  - id: example/not-watched
+    monitor: false
+`;
+
+const manifestEnv = {
+  EXAMPLE_TOKEN_A: jwt({ exp: MANIFEST_FUTURE }),
+  EXAMPLE_TOKEN_B: jwt({ exp: MANIFEST_FUTURE }),
+};
+
+function onlyProblem(text: string): string {
+  const { problems, credentials, unprobedIds } = loadManifestCredentials(text);
+  assertEquals(problems.length, 1, problems.join(" | "));
+  assertEquals(credentials, []);
+  assertEquals(unprobedIds, []);
+  return problems[0];
+}
+
+Deno.test("manifest: every field maps onto a credential entry", () => {
+  const { credentials, unprobedIds, problems } = loadManifestCredentials(`
+credentials:
+  - id: pat/vault-held
+    monitor: true
+    probe: github-pat
+    probe_source: {vault: example-vault, key: item/field}
+    holder: the job that breaks
+    other_field: ignored
+  - id: jwt/env-held
+    monitor: true
+    probe: jwt
+    probe_source: {env: EXAMPLE_NAME}
+  - id: pve/with-subject
+    monitor: true
+    probe: pve-token
+    probe_source: {vault: example-vault, key: pve/reader}
+    probe_subject: reader@pam!example
+  - id: serve/no-source
+    monitor: true
+    probe: swamp-serve-token
+    probe_subject: example-token
+`);
+  assertEquals(problems, []);
+  assertEquals(unprobedIds, []);
+  assertEquals(credentials, [
+    {
+      id: "pat/vault-held",
+      kind: "github-pat",
+      secretRef: { vault: "example-vault", key: "item/field" },
+      note: "the job that breaks",
+      subject: "",
+    },
+    {
+      id: "jwt/env-held",
+      kind: "jwt",
+      secretRef: { env: "EXAMPLE_NAME" },
+      note: "",
+      subject: "",
+    },
+    {
+      id: "pve/with-subject",
+      kind: "pve-token",
+      secretRef: { vault: "example-vault", key: "pve/reader" },
+      note: "",
+      subject: "reader@pam!example",
+    },
+    {
+      id: "serve/no-source",
+      kind: "swamp-serve-token",
+      note: "",
+      subject: "example-token",
+    },
+  ]);
+});
+
+Deno.test("manifest: no probe and `asserted` are unprobed; monitor false or absent is ignored", () => {
+  const { credentials, unprobedIds, problems } = loadManifestCredentials(`
+credentials:
+  - {id: a/probed, monitor: true, probe: jwt, probe_source: {env: EXAMPLE}}
+  - {id: b/no-probe, monitor: true}
+  - {id: c/asserted, monitor: true, probe: asserted}
+  - {id: d/off, monitor: false}
+  - {id: e/absent}
+`);
+  assertEquals(problems, []);
+  assertEquals(credentials.map((c) => c.id), ["a/probed"]);
+  assertEquals(unprobedIds, ["b/no-probe", "c/asserted"]);
+});
+
+Deno.test("manifest: anything not fully understood refuses the whole list", () => {
+  const cases: Array<[string, string, string]> = [
+    ["no list", "other: 1\n", "manifest has no top-level `credentials` list"],
+    ["list at top", "- a\n", "manifest has no top-level `credentials` list"],
+    ["scalar doc", "hello\n", "manifest has no top-level `credentials` list"],
+    ["empty", "", "manifest has no top-level `credentials` list"],
+    [
+      "item not a mapping",
+      "credentials: [justastring]\n",
+      "credentials[0] is not a mapping",
+    ],
+    ["null item", "credentials: [null]\n", "credentials[0] is not a mapping"],
+    [
+      "date item",
+      "credentials: [2026-11-03]\n",
+      "credentials[0] is not a mapping",
+    ],
+    [
+      "binary item",
+      "credentials: [!!binary aGVsbG8=]\n",
+      "credentials[0] is not a mapping",
+    ],
+    [
+      "misspelt probe, nothing else",
+      "credentials: [{id: a, monitor: true, prob: jwt}]\n",
+      "misspelt probe field on a",
+    ],
+    [
+      "misspelt probe_subject",
+      "credentials: [{id: a, monitor: true, probe: pve-token, probe_source: {env: X}, probe_subjct: u}]\n",
+      "misspelt probe field on a",
+    ],
+    [
+      "legacy probe_target",
+      "credentials: [{id: a, monitor: true, probe_target: x}]\n",
+      "misspelt probe field on a",
+    ],
+    [
+      "subject on a kind that never reads one",
+      "credentials: [{id: a, monitor: true, probe: jwt, probe_source: {env: X}, probe_subject: u}]\n",
+      "jwt takes no probe_subject on a",
+    ],
+    [
+      "asserted with a source",
+      "credentials: [{id: a, monitor: true, probe: asserted, probe_source: {env: X}}]\n",
+      "asserted takes no probe_source/probe_subject on a",
+    ],
+    [
+      "asserted with a subject",
+      "credentials: [{id: a, monitor: true, probe: asserted, probe_subject: u}]\n",
+      "asserted takes no probe_source/probe_subject on a",
+    ],
+    [
+      "monitored without an id",
+      "credentials: [{monitor: true}]\n",
+      "credentials[0] is monitored but has no string id",
+    ],
+    [
+      "non-string id",
+      "credentials: [{id: 7, monitor: true}]\n",
+      "credentials[0] is monitored but has no string id",
+    ],
+    [
+      "non-boolean monitor",
+      "credentials: [{id: a, monitor: 'true'}]\n",
+      "`monitor` is not a boolean on a",
+    ],
+    [
+      "probe without monitor",
+      "credentials: [{id: a, probe: jwt}]\n",
+      "probe set but monitor is not true on a",
+    ],
+    [
+      "source with monitor false",
+      "credentials: [{id: a, monitor: false, probe_source: {env: X}}]\n",
+      "probe set but monitor is not true on a",
+    ],
+    [
+      "source with no probe",
+      "credentials: [{id: a, monitor: true, probe_source: {env: X}}]\n",
+      "probe_source/probe_subject without probe on a",
+    ],
+    [
+      "unknown probe",
+      "credentials: [{id: a, monitor: true, probe: jwtt, probe_source: {env: X}}]\n",
+      "unknown probe on a",
+    ],
+    [
+      "non-string probe",
+      "credentials: [{id: a, monitor: true, probe: 7}]\n",
+      "unknown probe on a",
+    ],
+    [
+      "scaleway-key with no subject",
+      "credentials: [{id: a, monitor: true, probe: scaleway-key, probe_source: {env: X}}]\n",
+      "scaleway-key entry a has no probe_subject",
+    ],
+    [
+      "serve token with no subject",
+      "credentials: [{id: a, monitor: true, probe: swamp-serve-token}]\n",
+      "swamp-serve-token entry a has no probe_subject",
+    ],
+    [
+      "secret-needing kind with no source",
+      "credentials: [{id: a, monitor: true, probe: jwt}]\n",
+      "invalid entry on a: set exactly one of `secret` and `secretRef`",
+    ],
+    [
+      "secretless kind with a source",
+      "credentials: [{id: a, monitor: true, probe: swamp-serve-token, probe_subject: s, probe_source: {env: X}}]\n",
+      "invalid entry on a: `swamp-serve-token` takes no secret: set neither `secret` nor `secretRef`",
+    ],
+    [
+      "nothing to probe",
+      "credentials: [{id: a, monitor: true}, {id: b, monitor: false}]\n",
+      "manifest has no entry that can be probed",
+    ],
+  ];
+  for (const [name, text, expected] of cases) {
+    assertEquals(onlyProblem(text), expected, name);
+  }
+});
+
+Deno.test("manifest: a probe_source with both, neither or extra keys is refused, naming no value", () => {
+  for (
+    const source of [
+      "{vault: SENTINEL-V, key: SENTINEL-K, env: SENTINEL-E}",
+      "{vault: SENTINEL-V}",
+      "{}",
+      "{vault: SENTINEL-V, key: SENTINEL-K, extra: SENTINEL-X}",
+      "SENTINEL-STRING",
+    ]
+  ) {
+    const problem = onlyProblem(
+      `credentials: [{id: a, monitor: true, probe: jwt, probe_source: ${source}}]\n`,
+    );
+    assertEquals(problem.startsWith("invalid secretRef on a"), true, problem);
+    assertEquals(problem.includes("SENTINEL"), false, problem);
+  }
+});
+
+Deno.test("manifest: duplicates are refused across every monitored id, probed or not", () => {
+  const probed = "{id: a, monitor: true, probe: jwt, probe_source: {env: X}}";
+  assertEquals(
+    onlyProblem(`credentials: [${probed}, {id: a, monitor: true}]\n`),
+    "duplicate id: a",
+  );
+  assertEquals(
+    onlyProblem(
+      `credentials: [${probed}, {id: b, monitor: true}, {id: b, monitor: true}]\n`,
+    ),
+    "duplicate id: b",
+  );
+  assertEquals(
+    onlyProblem(
+      `credentials: [${probed}, {id: c/d, monitor: true}, {id: c-d, monitor: true}]\n`,
+    ).includes("both normalise"),
+    true,
+  );
+});
+
+Deno.test("manifest: a YAML error reports its line and never the source text", () => {
+  const broken = "credentials: [\n  {id: SENTINEL-VALUE, : :\n";
+  const problem = onlyProblem(broken);
+  assertEquals(
+    /^manifest is not valid YAML \(line \d+\)$/.test(problem),
+    true,
+    problem,
+  );
+  assertEquals(problem.includes("SENTINEL"), false);
+});
+
+Deno.test("credentialSourceProblems: exactly one source, and a path inside the repo", () => {
+  const list = [{ id: "a" }];
+  const p = (path: string) => credentialSourceProblems({ manifest: { path } });
+  assertEquals(credentialSourceProblems({ credentials: list }), []);
+  assertEquals(p("inventory/list.yaml"), []);
+  assertEquals(p("./inventory/list.yaml"), []);
+  assertEquals(credentialSourceProblems({}), [
+    "set exactly one of `credentials` and `manifest`",
+  ]);
+  assertEquals(
+    credentialSourceProblems({ credentials: list, manifest: { path: "a" } }),
+    ["set exactly one of `credentials` and `manifest`"],
+  );
+  for (const abs of ["/etc/passwd", "\\etc", "C:/x"]) {
+    assertEquals(p(abs), [
+      "`manifest.path` must be relative to the repository root",
+    ]);
+  }
+  for (const up of ["../x", "a/../../x", "a\\..\\x", ".."]) {
+    assertEquals(p(up), ["`manifest.path` must not contain a `..` segment"]);
+  }
+  for (const none of [".", "./", "./."]) {
+    assertEquals(p(none), ["`manifest.path` names no file"]);
+  }
+});
+
+Deno.test("global arguments: the schema refuses both, neither and an escaping path", () => {
+  const credentials = [{ id: "a", kind: "jwt", secret: "x" }];
+  const parse = (a: unknown) => model.globalArguments.safeParse(a).success;
+  assertEquals(parse({ credentials }), true);
+  assertEquals(parse({ manifest: { path: "inventory/list.yaml" } }), true);
+  assertEquals(parse({}), false);
+  assertEquals(parse({ credentials, manifest: { path: "a" } }), false);
+  assertEquals(parse({ manifest: { path: "../a" } }), false);
+  assertEquals(parse({ manifest: { path: "/a" } }), false);
+  assertEquals(parse({ manifest: { path: "a", extra: 1 } }), false);
+});
+
+Deno.test("secretRef: an inline entry with both a vault and an env name is refused, not stripped", () => {
+  const parse = (secretRef: unknown) =>
+    model.globalArguments.safeParse({
+      credentials: [{ id: "a", kind: "jwt", secretRef }],
+    }).success;
+  assertEquals(parse({ env: "NAME" }), true);
+  assertEquals(parse({ vault: "v", key: "k" }), true);
+  assertEquals(parse({ vault: "v", key: "k", env: "NAME" }), false);
+  assertEquals(parse({ env: "not a name" }), false);
+});
+
+Deno.test("manifestPathFor: a deliberate join, dropping `.` segments and a trailing slash", () => {
+  assertEquals(manifestPathFor("/repo", "a/b.yaml"), "/repo/a/b.yaml");
+  assertEquals(manifestPathFor("/repo/", "./a//b.yaml"), "/repo/a/b.yaml");
+});
+
+Deno.test("resolveSecret: an env ref reads the environment and registers the value", async () => {
+  const redacted: string[] = [];
+  const redactor = { addSecret: (v: string) => redacted.push(v) };
+  const ref = { secretRef: { env: "EXAMPLE_NAME" } };
+  await withIo({ env: { EXAMPLE_NAME: "the-value" } }, async () => {
+    assertEquals(await resolveSecret(ref, undefined, redactor), {
+      secret: "the-value",
+    });
+  });
+  assertEquals(redacted, ["the-value"]);
+  await withIo({}, async () => {
+    assertEquals(await resolveSecret(ref, undefined), {
+      detail: "env EXAMPLE_NAME is unset or empty",
+    });
+  });
+  await withIo({ env: { EXAMPLE_NAME: "" } }, async () => {
+    assertEquals(await resolveSecret(ref, undefined), {
+      detail: "env EXAMPLE_NAME is unset or empty",
+    });
+  });
+});
+
+Deno.test("resolveSecret: an env read that throws is the entry's finding, not a throw", async () => {
+  const original = ioDeps.getEnv;
+  ioDeps.getEnv = () => {
+    throw new Deno.errors.PermissionDenied("SENTINEL");
+  };
+  try {
+    assertEquals(
+      await resolveSecret({ secretRef: { env: "EXAMPLE_NAME" } }, undefined),
+      { detail: "env EXAMPLE_NAME could not be read" },
+    );
+  } finally {
+    ioDeps.getEnv = original;
+  }
+});
+
+Deno.test("pickSweepCredential: entries sharing one env ref are one secret; different refs are ambiguous", () => {
+  const key = (
+    id: string,
+    secretRef: { env: string } | { vault: string; key: string },
+  ) => ({
+    id,
+    kind: "scaleway-key" as const,
+    secretRef,
+  });
+  const same = [key("a", { env: "X" }), key("b", { env: "X" })];
+  assertEquals(
+    (pickSweepCredential(same, undefined) as { id: string }).id,
+    "a",
+  );
+  assertEquals(
+    typeof pickSweepCredential(
+      [key("a", { env: "X" }), key("b", { env: "Y" })],
+      undefined,
+    ),
+    "string",
+  );
+  assertEquals(
+    typeof pickSweepCredential(
+      [key("a", { env: "X" }), key("b", { vault: "X", key: "Y" })],
+      undefined,
+    ),
+    "string",
+  );
+});
+
+function manifestAudit() {
+  return createModelTestContext({
+    methodName: "audit",
+    repoDir: "/repo",
+    globalArgs: model.globalArguments.parse({
+      manifest: { path: "./inventory/list.yaml" },
+    }),
+  });
+}
+
+async function runAudit(context: unknown) {
+  await model.methods.audit.execute(
+    {},
+    context as Parameters<typeof model.methods.audit.execute>[1],
+  );
+}
+
+Deno.test("manifest audit: writes one resource per probed entry, and counts the rest", async () => {
+  const { context, getWrittenResources } = manifestAudit();
+  await withIo(
+    {
+      files: { "/repo/inventory/list.yaml": MANIFEST_FIXTURE },
+      env: manifestEnv,
+    },
+    () => runAudit(context),
+  );
+  const written = getWrittenResources();
+  const creds = written.filter((r) => r.specName === "credential");
+  assertEquals(
+    creds.map((r) => [r.data.id, r.data.status]),
+    [["connect-token/example-a", "ok"], ["connect-token/example-b", "ok"]],
+  );
+  assertEquals(creds[0].data.note, "example job a");
+  const audit = written.find((r) => r.specName === "audit")!.data;
+  assertEquals(audit.total, 2);
+  assertEquals(audit.ok, 2);
+  assertEquals(audit.source, "manifest");
+  assertEquals(audit.unprobed, 1);
+  assertEquals(audit.unprobedIds, ["example/no-probe"]);
+  assertEquals(audit.manifestPath, "/repo/inventory/list.yaml");
+  // Unprobed is neither actionable nor a reason to notify, and the body carries
+  // the count and no id.
+  assertEquals(audit.actionable, false);
+  assertEquals(audit.notifyToday, false);
+  assertEquals(audit.summary, "UNPROBED 1 monitored entries have no probe");
+});
+
+Deno.test("manifest audit: an inline twin writes the same credentials", async () => {
+  const twin = createModelTestContext({
+    methodName: "audit",
+    globalArgs: model.globalArguments.parse({
+      credentials: [
+        {
+          id: "connect-token/example-a",
+          kind: "jwt",
+          secretRef: { env: "EXAMPLE_TOKEN_A" },
+          note: "example job a",
+        },
+        {
+          id: "connect-token/example-b",
+          kind: "jwt",
+          secretRef: { env: "EXAMPLE_TOKEN_B" },
+        },
+      ],
+    }),
+  });
+  const fromManifest = manifestAudit();
+  await withIo(
+    {
+      files: { "/repo/inventory/list.yaml": MANIFEST_FIXTURE },
+      env: manifestEnv,
+    },
+    async () => {
+      await runAudit(twin.context);
+      await runAudit(fromManifest.context);
+    },
+  );
+  const shape = (rows: ReturnType<typeof twin.getWrittenResources>) =>
+    rows.filter((r) => r.specName === "credential").map((r) => ({
+      ...r.data,
+      checkedAt: "",
+    }));
+  assertEquals(
+    shape(twin.getWrittenResources()),
+    shape(fromManifest.getWrittenResources()),
+  );
+  const audit = twin.getWrittenResources().find((r) => r.specName === "audit")!
+    .data;
+  assertEquals(audit.source, "inline");
+  assertEquals(audit.unprobed, 0);
+  assertEquals(audit.unprobedIds, []);
+  assertEquals(audit.manifestPath, null);
+  assertEquals(audit.summary, "");
+});
+
+Deno.test("manifest audit: a problem refuses the run and writes nothing, and a read error names no contents", async () => {
+  const refused = async (files: Record<string, string>, expected: string) => {
+    const { context, getWrittenResources } = manifestAudit();
+    let message = "";
+    await withIo({ files }, async () => {
+      try {
+        await runAudit(context);
+      } catch (e) {
+        message = (e as Error).message;
+      }
+    });
+    assertEquals(
+      message.startsWith("credential-expiry configuration is invalid"),
+      true,
+      message,
+    );
+    assertEquals(message.includes(expected), true, message);
+    assertEquals(message.includes("SENTINEL"), false, message);
+    assertEquals(getWrittenResources(), []);
+  };
+  await refused(
+    {},
+    "could not read manifest /repo/inventory/list.yaml: NotFound",
+  );
+  await refused(
+    { "/repo/inventory/list.yaml": "credentials: [\n {id: SENTINEL, : :\n" },
+    "manifest is not valid YAML (line",
+  );
+  await refused(
+    {
+      "/repo/inventory/list.yaml":
+        "credentials: [{id: a, monitor: true, probe: nope}]\n",
+    },
+    "unknown probe on a",
+  );
+});
+
+Deno.test("audit: the source rules hold even when the schema's refinement did not run", async () => {
+  // swamp skips object refinements while a global argument holds an unresolved
+  // expression, so execute must not depend on them.
+  for (
+    const [globalArgs, expected] of [
+      [{}, "set exactly one"],
+      [{ manifest: { path: "../x" } }, "`..` segment"],
+      [{ manifest: { path: "/x" } }, "must be relative"],
+      [
+        { manifest: { path: "x" }, credentials: [{ id: "a" }] },
+        "set exactly one",
+      ],
+    ] as const
+  ) {
+    const { context } = createModelTestContext({
+      methodName: "audit",
+      repoDir: "/repo",
+      globalArgs: { warnDays: [30], criticalDays: 3, ...globalArgs },
+    });
+    let message = "";
+    try {
+      await runAudit(context);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    assertEquals(message.includes(expected), true, message);
+  }
+});
+
+function manifestSweep(path = "list.yaml") {
+  return createModelTestContext({
+    methodName: "sweep",
+    repoDir: "/repo",
+    globalArgs: model.globalArguments.parse({
+      scwOrganizationId: SWEEP_ORG,
+      manifest: { path },
+    }),
+  });
+}
+
+async function runManifestSweep(context: unknown) {
+  await model.methods.sweep.execute(
+    {},
+    context as Parameters<typeof model.methods.sweep.execute>[1],
+  );
+}
+
+Deno.test("manifest sweep: the manifest's scaleway-key entries are the manifested set", async () => {
+  const { context, getWrittenResources } = manifestSweep();
+  const manifest = `
+credentials:
+  - id: scaleway/a
+    monitor: true
+    probe: scaleway-key
+    probe_source: {env: EXAMPLE_PROBE}
+    probe_subject: ${KEY_A}
+  - {id: unwatched/key, monitor: true}
+`;
+  await withIo(
+    {
+      files: { "/repo/list.yaml": manifest },
+      env: { EXAMPLE_PROBE: SWEEP_SECRET },
+    },
+    () =>
+      withFetch(
+        scwListing([
+          {
+            access_key: KEY_A,
+            expires_at: "2030-01-01T00:00:00Z",
+            user_id: "u",
+            created_at: "2026-01-01T00:00:00Z",
+            description: "",
+          },
+          {
+            access_key: KEY_B,
+            expires_at: "2030-01-01T00:00:00Z",
+            user_id: "u",
+            created_at: "2026-01-01T00:00:00Z",
+            description: "",
+          },
+        ]),
+        () => runManifestSweep(context),
+      ),
+  );
+  const sweep = getWrittenResources().find((r) => r.specName === "sweep")!.data;
+  assertEquals(sweep.status, "findings");
+  assertEquals(sweep.credentialId, "scaleway/a");
+  assertEquals(sweep.manifested, 1);
+  assertEquals(sweep.unmanifested, [KEY_B]);
+});
+
+Deno.test("manifest sweep: a bad manifest is a misconfigured resource, never a throw", async () => {
+  const cases: Array<[Record<string, string>, string]> = [
+    [{}, "could not read manifest /repo/list.yaml: NotFound"],
+    [
+      { "/repo/list.yaml": "credentials: [\n {id: SENTINEL, : :\n" },
+      "manifest is not valid YAML (line",
+    ],
+    [
+      {
+        "/repo/list.yaml":
+          "credentials: [{id: a, monitor: true}, {id: a, monitor: true}]\n",
+      },
+      "duplicate id: a",
+    ],
+  ];
+  for (const [files, expected] of cases) {
+    const { context, getWrittenResources } = manifestSweep();
+    await withIo({ files }, () => runManifestSweep(context));
+    const sweep = getWrittenResources().find((r) =>
+      r.specName === "sweep"
+    )!.data;
+    assertEquals(sweep.status, "misconfigured");
+    assertEquals(sweep.notify, true);
+    assertEquals(sweep.manifested, 0);
+    assertEquals(
+      String(sweep.detail).includes(expected),
+      true,
+      String(sweep.detail),
+    );
+    assertEquals(String(sweep.detail).includes("SENTINEL"), false);
+  }
+});
+
+Deno.test("sweep: inline mode gains no preflight", async () => {
+  // Today's sweep does not run preflight; a duplicate id is the audit's finding.
+  const { sweep } = await runSweep(
+    scwListing([]),
+    {
+      credentials: [
+        {
+          id: "scaleway/a",
+          kind: "scaleway-key",
+          secretRef: { vault: "store", key: "probe/secret" },
+          subject: KEY_A,
+        },
+        {
+          id: "scaleway/a",
+          kind: "scaleway-key",
+          secretRef: { vault: "store", key: "probe/secret" },
+          subject: KEY_B,
+        },
+      ],
+    },
+  );
+  assertEquals(sweep.status, "ok");
+});
+
+Deno.test("an inline scaleway-key or serve-token with no subject still parses, and reports at probe time", () => {
+  // The loader refuses these; the shared schema deliberately does not, because
+  // an inline entry's missing subject is that entry's finding, not the run's.
+  for (
+    const entry of [
+      { id: "a", kind: "scaleway-key", secret: "x" },
+      { id: "a", kind: "swamp-serve-token" },
+    ]
+  ) {
+    assertEquals(
+      model.globalArguments.safeParse({ credentials: [entry] }).success,
+      true,
+    );
+  }
+});
+
+Deno.test("audit: resources written before the manifest fields still validate, with defaults", () => {
+  const audit = model.resources.audit.schema.parse({
+    checkedAt: "2026-10-22T00:00:00.000Z",
+    total: 1,
+    ok: 1,
+    warn: 0,
+    critical: 0,
+    expired: 0,
+    authFailed: 0,
+    unresolved: 0,
+    unreachable: 0,
+    noExpiry: 0,
+    soonestDays: null,
+    soonestId: null,
+    actionable: false,
+    notifyToday: false,
+    notifyReason: "",
+    summary: "",
+  });
+  assertEquals(audit.source, "inline");
+  assertEquals(audit.unprobed, 0);
+  assertEquals(audit.unprobedIds, []);
+  assertEquals(audit.manifestPath, null);
+});
+
+Deno.test("yamlErrorLine: captures digits only, and falls back rather than echoing", () => {
+  assertEquals(
+    yamlErrorLine(new SyntaxError("bad at line 12, column 3:\n  SENTINEL: x")),
+    "line 12",
+  );
+  for (
+    const e of [
+      new Error("SENTINEL with no position"),
+      new Error("at line SENTINEL, column 3:"),
+      "SENTINEL",
+      undefined,
+    ]
+  ) {
+    assertEquals(yamlErrorLine(e), "line unknown");
+  }
+});
+
+Deno.test("sweep: the source rules hold even when the schema's refinement did not run", async () => {
+  for (
+    const [globalArgs, expected] of [
+      [{}, "set exactly one"],
+      [{ manifest: { path: "../x" } }, "`..` segment"],
+      [{ manifest: { path: "/x" } }, "must be relative"],
+    ] as const
+  ) {
+    const { context, getWrittenResources } = createModelTestContext({
+      methodName: "sweep",
+      repoDir: "/repo",
+      globalArgs: { scwOrganizationId: SWEEP_ORG, ...globalArgs },
+    });
+    await runManifestSweep(context);
+    const sweep = getWrittenResources().find((r) =>
+      r.specName === "sweep"
+    )!.data;
+    assertEquals(sweep.status, "misconfigured");
+    assertEquals(sweep.notify, true);
+    assertEquals(sweep.manifested, 0);
+    assertEquals(
+      String(sweep.detail).includes(expected),
+      true,
+      String(sweep.detail),
+    );
+  }
+});
+
+Deno.test("manifest: neither a misspelt field's name nor a key inside a source is repeated", () => {
+  for (
+    const entry of [
+      "{id: a, monitor: true, probe: jwt, probe_source: {env: X}, probSENTINEL: 1}",
+      "{id: a, monitor: true, probe: jwt, probe_source: {env: X, SENTINEL: 1}}",
+      "{id: a, monitor: true, probe: jwt, probe_source: {vault: v, key: k, SENTINEL: 1}}",
+    ]
+  ) {
+    const problem = onlyProblem(`credentials: [${entry}]\n`);
+    assertEquals(problem.includes("SENTINEL"), false, problem);
+  }
+});
+
+Deno.test("manifest: a multi-line holder becomes a one-line note", () => {
+  const { credentials } = loadManifestCredentials(
+    "credentials:\n  - id: a\n    monitor: true\n    probe: jwt\n    probe_source: {env: X}\n    holder: |\n      first line\n        second   line\n",
+  );
+  assertEquals(credentials[0].note, "first line second line");
+});
+
+Deno.test("manifest: a pve-token or b2-key with no subject reports on itself, as inline", () => {
+  const { credentials, problems } = loadManifestCredentials(
+    "credentials: [{id: a, monitor: true, probe: pve-token, probe_source: {env: X}}]\n",
+  );
+  assertEquals(problems, []);
+  assertEquals(credentials[0].subject, "");
+});
+
+Deno.test("manifest: `note` is the alert note, with `holder` as the fallback", () => {
+  const { credentials, problems } = loadManifestCredentials(`
+credentials:
+  - id: a/both
+    monitor: true
+    probe: jwt
+    probe_source: {env: X}
+    holder: where it lives
+    note: |
+      the nightly job stops
+        silently
+  - id: b/holder-only
+    monitor: true
+    probe: jwt
+    probe_source: {env: X}
+    holder: where it lives
+  - id: c/neither
+    monitor: true
+    probe: jwt
+    probe_source: {env: X}
+`);
+  assertEquals(problems, []);
+  assertEquals(credentials.map((c) => c.note), [
+    "the nightly job stops silently",
+    "where it lives",
+    "",
+  ]);
+});
+
+Deno.test("manifest: a non-string note is refused, not coerced, and its value is not repeated", () => {
+  const problem = onlyProblem(
+    "credentials: [{id: a, monitor: true, probe: jwt, probe_source: {env: X}, note: {SENTINEL: 1}}]\n",
+  );
+  assertEquals(problem.startsWith("invalid note on a"), true, problem);
+  assertEquals(problem.includes("SENTINEL"), false, problem);
+});
+
+Deno.test("manifest audit: an alert line carries `note`, not `holder`", async () => {
+  const { context, getWrittenResources } = manifestAudit();
+  const manifest = `
+credentials:
+  - id: a/expired
+    monitor: true
+    probe: jwt
+    probe_source: {env: EXAMPLE_TOKEN_A}
+    holder: where it lives
+    note: the nightly job stops
+`;
+  await withIo(
+    {
+      files: { "/repo/inventory/list.yaml": manifest },
+      env: {
+        EXAMPLE_TOKEN_A: jwt({ exp: Math.floor(Date.now() / 1000) - 86_400 }),
+      },
+    },
+    () => runAudit(context),
+  );
+  const audit = getWrittenResources().find((r) => r.specName === "audit")!.data;
+  assertEquals(
+    String(audit.summary).includes("(the nightly job stops)"),
+    true,
+    String(audit.summary),
+  );
+  assertEquals(String(audit.summary).includes("where it lives"), false);
 });
